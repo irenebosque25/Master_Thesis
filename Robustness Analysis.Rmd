@@ -1,0 +1,338 @@
+---
+title: "Robustness Analysis"
+output: html_document
+date: "2025-08-27"
+---
+# Libraries
+
+```{r}
+library(tidyverse)
+library(stringr)
+library(gt)
+```
+
+
+# Robustness analysis  
+
+This section evaluates the robustness of apportionment methods, understood as their stability when faced with small changes in vote shares. The analysis asks whether minor perturbations in electoral support can trigger large shifts in the allocation of seats. To test this, provincial-level data from four elections were used: 1989 and 2000 (bipartisan contexts) and 2016 and November 2019 (multiparty contexts).  
+
+The procedure follows four steps:
+
+1. Prepare provincial-level datasets with party identifiers, valid vote shares, blank ballots, and district seat totals.  
+2. Simulate alternative vote-share distributions using a Dirichlet model, which generates random vectors that remain bounded between 0 and 1 and always sum to 100%.  
+3. Apply different apportionment methods (D’Hondt, Webster, Adams, Hagenbach–Bischoff, and Hamilton) to each simulated scenario at the provincial level.  
+4. Aggregate results to the national level, producing distributions of seat allocations by party, election, method, and simulation.  
+
+These outputs allow the calculation of dispersion measures such as the standard deviation, interquartile range, and full range of seat outcomes across 1,000 simulations, providing a clear picture of how sensitive each method is to electoral volatility.
+
+## Dataset selection
+
+We begin by selecting four elections that capture different political contexts: two from a bipartisan period (1989 and 2000) and two from a more fragmented multiparty system (2016 and November 2019). Each dataset is at the provincial level and contains information on votes, candidacies, and district magnitudes.
+
+```{r}
+datasets_prov <- list(
+  e2019N = e2019Nprov,
+  e2016 = e2016prov,
+  e2000 = e2000prov,
+  e1989 = e1989prov
+)
+```
+
+The first step prepares the baseline dataset for each election. For every province, votes are aggregated by party, filtered, and standardized into valid vote shares (`porc_candidacies_valid`). This information is then combined with blank votes and the number of seats assigned to each province (from the manually compiled `total_seats` table). The resulting dataset (`baseline_all`) contains the party identifiers, their vote proportions, and the district magnitudes for each province and election year.
+
+```{r}
+prepare_baseline <- function(df, total_seats) {
+  votes_by_prov <- df %>%
+    group_by(id_elec, prov, id_candidacies_nat, abbrev_candidacies, blank_ballots) %>%
+    summarise(
+      total_ballots = first(party_ballots),
+      party_pct = first(porc_candidacies_valid) / 100,
+      ballots = first(ballots),
+      blank_ballots = first(blank_ballots),
+      .groups = "drop"
+    ) %>%
+    filter(!is.na(party_pct)) %>%
+    arrange(id_elec, prov, desc(party_pct)) %>%
+    mutate(
+      election = str_extract(id_elec, "\\d{4}"),
+      election = as.character(election),
+      prov = str_trim(prov)
+    ) %>%
+    left_join(total_seats %>%
+                mutate(prov = str_trim(prov),
+                       election = as.character(election)) %>%
+                rename(seats = seats),
+              by = c("prov", "election"))
+
+  baseline_by_unit <- votes_by_prov %>%
+    group_by(election, prov) %>%
+    summarise(
+      id_candidacies_nat = list(id_candidacies_nat),
+      abbrev_candidacies = list(abbrev_candidacies),
+      prop = list(party_pct / sum(party_pct, na.rm = TRUE)),
+      total_ballots = first(total_ballots),
+      blank_ballots = first(blank_ballots),
+      seats_in_prov = first(seats),
+      .groups = "drop"
+    )
+
+  return(baseline_by_unit)
+}
+
+baseline_all <- map(datasets, ~ prepare_baseline(.x, total_seats))
+```
+
+To test robustness, alternative vote distributions are generated around the observed results. A Dirichlet distribution is applied to simulate 1,000 vote-share vectors for each province. This distribution is particularly suited for electoral data because it produces proportions bounded between 0 and 1 that always sum to 100%, preserving the compositional nature of vote shares.
+
+```{r}
+simulate_baseline <- function(baseline_by_unit, nsim = 100, concentration = 1000) {
+  simulate_vote_shares <- function(vote_props, nsim, concentration) {
+    alpha <- vote_props * concentration
+    sims <- MCMCpack::rdirichlet(nsim, alpha)
+    return(sims)
+  }
+
+  baseline_with_sims <- baseline_by_unit %>%
+    mutate(
+      vote_sims = map(prop, simulate_vote_shares,
+                      nsim = nsim, concentration = concentration)
+    )
+
+  return(baseline_with_sims)
+}
+
+
+sims_all <- map(baseline_all, ~ simulate_baseline(.x, nsim = 10, concentration = 1000))
+```
+
+Each simulated vote distribution is processed under different apportionment methods (D’Hondt, Webster, Adams, Hagenbach–Bischoff, and Hamilton). The function assign_seats() converts simulated vote shares into ballots and applies the chosen method, while process_province_simulations() repeats this procedure across provinces and simulations, producing matrices of seat allocations by party. This step proved to be extremely time-consuming: even with just four elections and 1,000 simulations per province, running all methods required more than 10 hours of computation.
+
+```{r}
+assign_seats <- function(vote_shares, total_ballots, blank_ballots, n_seats,
+                         method = "dhondt", candidacies = NULL, threshold = 0.03) {
+
+  # Convertir porcentajes a votos
+  ballots <- round(vote_shares * total_ballots)
+  if (is.null(candidacies)) candidacies <- seq_along(ballots)
+
+  # Seleccionar y ejecutar método
+  result <- switch(
+    tolower(method),
+
+    "dhondt" = dhondt_seats(candidacies, ballots, blank_ballots, n_seats, threshold, short_version = TRUE),
+    "adams" = adams_seats(candidacies, ballots, blank_ballots, n_seats, threshold, short_version = TRUE),
+    "hagenbach" = hagenbach_bischoff_seats(candidacies, ballots, blank_ballots, n_seats, short_version = TRUE),
+    "hamilton" = hamilton_seats(candidacies, ballots, blank_ballots, n_seats, short_version = TRUE),
+    "webster" = webster_seats(candidacies, ballots, blank_ballots, n_seats, threshold, short_version = TRUE),
+
+    stop("Non-recognize method ", method)
+  )
+
+  return(result)
+}
+
+#Lo aplica por provincia
+
+process_province_simulations <- function(row, method = "dhondt") {
+  sims <- row$vote_sims[[1]]  # matriz num_simulations x num_partidos
+  n_simulations <- nrow(sims)
+  id_candidacies_nat <- as.character(row$id_candidacies_nat[[1]])
+  results <- matrix(0, nrow = n_simulations, ncol = length(id_candidacies_nat))
+  colnames(results) <- id_candidacies_nat
+  for (i in seq_len(n_simulations)) {
+    vote_share <- sims[i, ]
+    tryCatch({
+      res <- assign_seats(
+        vote_shares = vote_share,
+        total_ballots = row$total_ballots,
+        blank_ballots = row$blank_ballots,
+        n_seats = row$seats_in_prov,
+        method = method,
+        candidacies = id_candidacies_nat
+      )
+      results[i, as.character(res$candidacies)] <- res$seats
+    }, error = function(e) {
+      results[i, ] <- NA
+    })
+  }
+  return(results)
+}
+
+result_list <- lapply(sims_all, function(df) {
+  df |>
+    rowwise() |>
+    mutate(
+      seat_sims_dhondt = list(process_province_simulations(cur_data(), method = "dhondt")),
+      seat_sims_hagenbach = list(process_province_simulations(cur_data(), method = "hagenbach")),
+      seat_sims_hamilton = list(process_province_simulations(cur_data(), method = "hamilton")),
+      seat_sims_adams = list(process_province_simulations(cur_data(), method = "adams")),
+      seat_sims_webster = list(process_province_simulations(cur_data(), method = "webster"))
+    ) |>
+    ungroup()
+})
+
+
+# saveRDS(result_list, file = "result_list.rds")
+# result_list <- readRDS("result_list.rds")
+```
+
+Finally, results are unpacked into a tidy format. For each election, method, party, and simulation, the total number of seats is computed at the national level. This dataset (`nat`) forms the basis for the robustness analysis and subsequent visualizations.
+
+```{r}
+methods <- c("dhondt","hagenbach","hamilton","adams","webster")
+
+
+unpack_all <- function(result_list) {
+  imap_dfr(result_list, function(tabla_elec, elec_name) {
+    bind_rows(lapply(methods, function(m) {
+      mcol <- paste0("seat_sims_", m)
+      if (!mcol %in% names(tabla_elec)) return(tibble()) 
+
+      tabla_elec %>%
+        select(election, prov, parties = abbrev_candidacies, sims = all_of(mcol)) %>%
+        pmap_dfr(function(election, prov, parties, sims) {
+          mat <- as.matrix(sims)
+          if (!is.null(dim(mat))) {
+            if (ncol(mat) != length(parties) && nrow(mat) == length(parties)) mat <- t(mat)
+          }
+          colnames(mat) <- parties
+
+          as_tibble(mat) %>%
+            mutate(sim = row_number()) %>%
+            pivot_longer(-sim, names_to = "party", values_to = "seats") %>%
+            mutate(election = election, prov = prov)
+        }) %>%
+        mutate(method = m)
+    }))
+  })
+}
+
+tidy_prov <- unpack_all(result_list)
+
+
+
+nat <- tidy_prov %>%
+  group_by(election, method, sim, party) %>%
+  summarise(seats = sum(seats, na.rm = TRUE), .groups = "drop")
+
+nat
+```
+
+
+# Data Visualization
+
+
+```{r}
+nat_stats <- nat %>%
+  group_by(election, method, party) %>%
+  summarise(
+    mean_seats = mean(seats),
+    sd_seats   = sd(seats),
+    p05        = quantile(seats, 0.05),
+    p50        = median(seats),
+    p95        = quantile(seats, 0.95),
+    min        = min(seats),
+    max        = max(seats),
+    total_iqr  = sum(p95 - p05, na.rm = TRUE),        
+    .groups = "drop"
+  ) %>%
+  arrange(election, method, desc(mean_seats))
+
+nat_stats 
+```
+
+
+
+```{r}
+prov_instability <- tidy_prov %>%
+  group_by(election, method, prov, sim) %>%
+  summarise(key = paste(party, seats, sep = "=", collapse = "|"),
+            .groups = "drop") %>%
+  count(election, method, prov, key, name = "freq") %>%
+  group_by(election, method, prov) %>%
+  summarise(
+    n_outcomes  = n(),                          
+    mode_share  = max(freq) / sum(freq),    
+    instability = 1 - mode_share,                 
+    .groups = "drop"
+  ) %>%
+  arrange(election, method, desc(instability))
+
+prov_instability 
+```
+
+```{r}
+robust_agg <- nat_stats %>%
+  group_by(method) %>%
+  summarise(
+    total_sd   = sum(sd_seats, na.rm = TRUE),
+    mean_sd    = mean(sd_seats, na.rm = TRUE),
+    max_sd     = max(sd_seats, na.rm = TRUE),
+    total_iqr  = sum(p95 - p05, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    method = str_remove(method, "^seats?_sims_"),  # quita "seat_sims_" o "seats_sims_"
+    method = case_when(
+      method == "dhondt"    ~ "D’Hondt",
+      method == "webster"   ~ "Webster",
+      method == "adams"     ~ "Adams",
+      method == "hagenbach" ~ "Hagenbach–Bischoff",
+      method == "hamilton"  ~ "Hamilton",
+      TRUE ~ str_to_title(method)
+    )
+  ) %>%
+  arrange(total_sd)
+
+
+robust_agg
+```
+
+
+```{r}
+tbl_gt <- robust_agg %>%
+  gt(rowname_col = NULL) %>% 
+  tab_header(
+    title = md("**Aggregate Robustness by Apportionment Method**"),
+    subtitle = md("Lower dispersion ⇒ higher robustness (1,000 vote-perturbation simulations per election)")
+  ) %>%
+  cols_label(
+    method    = "Method",
+    total_sd  = "Total SD",
+    mean_sd   = "Mean SD",
+    max_sd    = "Max SD",
+    total_iqr = "Total IQR (p95–p05)"
+  ) %>%
+  fmt_number(
+    columns = c(total_sd, mean_sd, max_sd, total_iqr),
+    decimals = 3
+  ) %>%
+  tab_source_note(
+    source_note = md("SD = standard deviation of seats; IQR = width between the 95th and 5th percentiles.")
+  ) %>%
+  tab_options(
+    table.font.size = px(13),
+    data_row.padding = px(6)
+  ) %>%
+  # Encabezados en negrita
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(everything())
+  ) %>%
+  # Poner la primera columna (Method) en negrita tipo "fila índice"
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(columns = method)
+  )
+
+tbl_gt
+```
+
+
+
+
+
+
+
+
+

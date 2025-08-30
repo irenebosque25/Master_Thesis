@@ -1,0 +1,3569 @@
+---
+title: "Main Analysis"
+output: html_document
+date: "2025-07-15"
+---
+
+# Packages and libraries
+
+```{r}
+# If the pollspain package is not installed, run:
+# devtools::install_github("dadosdelaplace/pollspain")
+```
+
+```{r}
+# Required libraries for the analysis
+
+library(tidyverse)
+library(pollspain)
+
+# Required libraries for visualizations
+
+library(ggrepel)
+library(RColorBrewer)
+library(showtext)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+library(cowplot)
+library(gt)
+library(scales)
+```
+
+# Apportionment methods formulas
+
+In this section, we define the functions that implement the different apportionment methods. This is one of the most technical parts of the project, since each method follows a different mathematical logic for distributing seats among parties.
+
+All functions take the same basic inputs:
+
+- candidacies: the party or candidacy identifier (e.g., id_candidacies_nat, the coded IDs we created in the party dictionary).
+- ballots: the number of valid votes obtained by each candidacy.
+- blank_ballots: the number of blank votes, used for computing thresholds and quotas.
+- n_seats: the number of seats to distribute in the district.
+- threshold: the minimum share of votes required for a party to enter the allocation (except Hamilton and Hagenbach–Bischoff who do not apply an electoral threshold)
+- short_version / long_version: by default, the functions return the short version, which contains the candidacy ID, the total ballots, and the seats obtained. The long version adds method-specific details, such as divisors and quotients in divisor methods, or remainders in largest remainder methods.
+
+The methods included are:
+
+- D’Hondt
+- Webster / Sainte-Laguë
+- Hamilton (Largest Remainder)
+- Adams
+- Dean
+- Hill–Huntington
+- Hagenbach–Bischoff
+- First-Past-the-Post (FPTP)
+
+The wrapper function allocate_seats() later calls these methods and standardizes the output so that results are directly comparable across systems.
+
+```{r}
+#D'HONDT
+
+dhondt_seats <-
+  function(candidacies, ballots, blank_ballots, n_seats,
+           threshold = 0.03, short_version = TRUE) {
+
+    if (length(unique(candidacies)) != length(candidacies)) {
+
+      data <-
+        tibble(candidacies, ballots) |>
+        summarise(ballots = sum(ballots, na.rm = TRUE), .by = candidacies)
+
+      candidacies <- data |> pull(candidacies)
+      ballots <- data |> pull(ballots)
+
+    }
+
+    # join information and filter by threshold
+    data <-
+      tibble(candidacies, ballots) |>
+      mutate("porc_ballots" = ballots/(sum(ballots) + first(blank_ballots)))
+
+    data_filtered <-
+      data |>
+      filter(porc_ballots >= threshold)
+
+    # quotients
+    quotients <-
+      (1:n_seats) |>
+      map_dfr(function (x) {
+        tibble("candidacies" = data_filtered$candidacies,
+               "divisor" = x,
+               "quotient" = (data_filtered |> pull(ballots)) / x)
+      })
+
+    # top quotients
+    top_quotients <-
+      quotients |>
+      left_join(data, by = "candidacies") |>
+      # in case of ties -> by ballots
+      arrange(desc(quotient), desc(ballots)) |>
+      slice(1:n_seats) |>
+      select(candidacies, divisor, quotient)
+
+    # seats
+    seats <-
+      top_quotients |>
+      count(candidacies, name = "seats") |>
+      arrange(desc(seats)) |>
+      full_join(tibble(candidacies), by = "candidacies") |>
+      mutate("seats" = if_else(is.na(seats), 0, seats)) |>
+      full_join(data, by = "candidacies")
+
+    if (short_version) {
+
+      return(seats |> select(candidacies, ballots, seats))
+
+    } else {
+
+      # in a long format we include the quotients
+      seats <-
+        seats |>
+        left_join(quotients |>
+                    pivot_wider(names_from = divisor,
+                                values_from = quotient),
+                  by = "candidacies") |>
+        set_names(c("candidacies", "seats", "ballots",
+                    "porc_ballots", paste0("quotient_", 1:n_seats))) |>
+        mutate("porc_seats" = 100*seats/sum(seats),
+               "porc_ballots" = 100*porc_ballots,
+               .after = ballots)
+
+      return(seats)
+    }
+  }
+```
+
+
+```{r}
+#HAMILTON
+
+hamilton_seats <- function(candidacies, ballots, blank_ballots, n_seats,
+                           short_version = TRUE) {
+
+  if (length(unique(candidacies)) != length(candidacies)) {
+
+    data <-
+      tibble(candidacies, ballots) |>
+      summarise(ballots = sum(ballots, na.rm = TRUE), .by = candidacies)
+
+    candidacies <- data |> pull(candidacies)
+    ballots <- data |> pull(ballots)
+
+  }
+
+  data <-
+    tibble(candidacies, ballots) |>
+    mutate("porc_ballots" = ballots/(sum(ballots) + first(blank_ballots)))
+
+  data_filtered <-
+    data
+
+  data_filtered <- data_filtered |>
+    mutate(
+      exact_seats = ballots / ((sum(ballots) + first(blank_ballots)) / n_seats),
+      # The dividend represents the quota
+      initial_seats = floor(exact_seats),
+      remainder = exact_seats - initial_seats
+    )
+
+  remaining_seats <- n_seats - sum(data_filtered$initial_seats)
+
+  data_filtered <- data_filtered |>
+    arrange(desc(remainder)) |>
+    mutate(extra_seat = if_else(row_number() <= remaining_seats, 1, 0)) |>
+    mutate(seats = initial_seats + extra_seat)
+
+  seats <- data_filtered |>
+    arrange(desc(seats)) |>
+    full_join(tibble(candidacies), by = "candidacies") |>
+    mutate("seats" = if_else(is.na(seats), 0, seats))
+
+  if (short_version) {
+
+    return(seats |> select(candidacies, ballots, seats))
+
+  } else {
+
+    seats <-
+      seats |>
+      mutate("porc_seats" = 100*seats/sum(seats),
+             "porc_ballots" = 100*porc_ballots,
+             .after = ballots)
+
+    return(seats)
+  }
+}
+```
+
+```{r}
+# HAGENBACH DISCOFF
+
+hagenbach_bischoff_seats <- function(candidacies, ballots, blank_ballots, n_seats,
+                                     short_version = TRUE) {
+
+
+  if (length(unique(candidacies)) != length(candidacies)) {
+
+    data <-
+      tibble(candidacies, ballots) |>
+      summarise(ballots = sum(ballots, na.rm = TRUE), .by = candidacies)
+
+    candidacies <- data |> pull(candidacies)
+    ballots <- data |> pull(ballots)
+
+  }
+
+  data <-
+    tibble(candidacies, ballots) |>
+    mutate("porc_ballots" = ballots/(sum(ballots) + first(blank_ballots)))
+
+  data_filtered <-
+    data
+
+  data_filtered <- data_filtered |>
+    mutate(
+      exact_seats = ballots / ((sum(ballots) + first(blank_ballots)) / (n_seats + 1)),
+      # The dividend represents the quota
+      initial_seats = floor(exact_seats),
+      remainder = exact_seats - initial_seats
+    )
+
+  remaining_seats <- n_seats - sum(data_filtered$initial_seats)
+
+  data_filtered <- data_filtered |>
+    arrange(desc(remainder)) |>
+    mutate(extra_seat = if_else(row_number() <= remaining_seats, 1, 0)) |>
+    mutate(seats = initial_seats + extra_seat)
+
+  seats <- data_filtered |>
+    arrange(desc(seats)) |>
+    full_join(tibble(candidacies), by = "candidacies") |>
+    mutate("seats" = if_else(is.na(seats), 0, seats))
+
+  if (short_version) {
+
+    return(seats |> select(candidacies, ballots, seats))
+
+  } else {
+
+    seats <-
+      seats |>
+      mutate("porc_seats" = 100*seats/sum(seats),
+             "porc_ballots" = 100*porc_ballots,
+             .after = ballots)
+
+    return(seats)
+  }
+}
+```
+
+```{r}
+#WEBSTER
+
+webster_seats <- function(candidacies, ballots, blank_ballots, n_seats,
+                          threshold = 0.03, short_version = TRUE) {
+
+  if (length(unique(candidacies)) != length(candidacies)) {
+
+    data <-
+      tibble(candidacies, ballots) |>
+      summarise(ballots = sum(ballots, na.rm = TRUE), .by = candidacies)
+
+    candidacies <- data |> pull(candidacies)
+    ballots <- data |> pull(ballots)
+
+  }
+
+  data <-
+    tibble(candidacies, ballots) |>
+    mutate("porc_ballots" = ballots/(sum(ballots) + first(blank_ballots)))
+
+  data_filtered <-
+    data |>
+    filter(porc_ballots >= threshold)
+
+  quotients <- seq(1, 2 * n_seats - 1, by = 2) |>
+    map_dfr(function (x) {tibble(
+      "candidacies"    = data_filtered |> pull(candidacies),
+      "divisor"  = x,
+      "quotient" = (data_filtered |> pull(ballots)) / x)
+    }
+    )
+
+  # top quotients
+  top_quotients <-
+    quotients |>
+    left_join(data, by = "candidacies") |>
+    # in case of ties -> by ballots
+    arrange(desc(quotient), desc(ballots)) |>
+    slice(1:n_seats) |>
+    select(candidacies, divisor, quotient)
+
+  # seats
+  seats <-
+    top_quotients |>
+    count(candidacies, name = "seats") |>
+    arrange(desc(seats)) |>
+    full_join(tibble(candidacies), by = "candidacies") |>
+    mutate("seats" = if_else(is.na(seats), 0, seats)) |>
+    full_join(data, by = "candidacies")
+
+  if (short_version) {
+
+    return(seats |> select(candidacies, ballots, seats))
+
+  } else {
+
+    seats <-
+      seats |>
+      left_join(quotients |>
+                  pivot_wider(names_from = divisor,
+                              values_from = quotient),
+                by = "candidacies") |>
+      set_names(c("candidacies", "seats", "ballots",
+                  "porc_ballots", paste0("quotient_", 1:n_seats))) |>
+      mutate("porc_seats" = 100*seats/sum(seats),
+             "porc_ballots" = 100*porc_ballots,
+             .after = ballots)
+
+    return(seats)
+  }
+}
+```
+
+
+```{r}
+hill_seats <- function(candidacies, ballots, blank_ballots, n_seats,
+                        threshold = 0.03, short_version = TRUE) {
+
+  if (length(unique(candidacies)) != length(candidacies)) {
+
+    data <-
+      tibble(candidacies, ballots) |>
+      summarise(ballots = sum(ballots, na.rm = TRUE), .by = candidacies)
+
+    candidacies <- data |> pull(candidacies)
+    ballots <- data |> pull(ballots)
+
+  }
+
+  data <-
+    tibble(candidacies, ballots) |>
+    mutate("porc_ballots" = ballots/(sum(ballots) + first(blank_ballots)))
+
+  data_filtered <-
+    data |>
+    filter(porc_ballots >= threshold)
+
+  quotients <- map_dfr(
+    1:n_seats,
+    function (x) {tibble(
+      "candidacies"    = data_filtered|> pull(candidacies),
+      "divisor"  = sqrt(x * (x + 1)),
+      "quotient" = data_filtered |> pull(ballots) / divisor)
+    }
+  )
+
+  # top quotients
+  top_quotients <-
+    quotients |>
+    left_join(data, by = "candidacies") |>
+    # in case of ties -> by ballots
+    arrange(desc(quotient), desc(ballots)) |>
+    slice(1:n_seats) |>
+    select(candidacies, divisor, quotient)
+
+  # seats
+  seats <-
+    top_quotients |>
+    count(candidacies, name = "seats") |>
+    arrange(desc(seats)) |>
+    full_join(tibble(candidacies), by = "candidacies") |>
+    mutate("seats" = if_else(is.na(seats), 0, seats)) |>
+    full_join(data, by = "candidacies")
+
+
+  if (short_version) {
+
+    return(seats |>  select(candidacies, ballots, seats))
+
+  } else {
+
+    seats <-
+      seats |>
+      left_join(quotients |>
+                  pivot_wider(names_from = divisor,
+                              values_from = quotient),
+                by = "candidacies") |>
+      set_names(c("candidacies", "seats", "ballots",
+                  "porc_ballots", paste0("quotient_", 1:n_seats))) |>
+      mutate("porc_seats" = 100*seats/sum(seats),
+             "porc_ballots" = 100*porc_ballots,
+             .after = ballots)
+
+    return(seats)
+  }
+}
+```
+
+```{r}
+# DEANS
+deans_seats <- function(candidacies, ballots, blank_ballots, n_seats,
+                        threshold = 0.03, short_version = TRUE) {
+
+  if (length(unique(candidacies)) != length(candidacies)) {
+
+    data <-
+      tibble(candidacies, ballots) |>
+      summarise(ballots = sum(ballots, na.rm = TRUE), .by = candidacies)
+
+    candidacies <- data |> pull(candidacies)
+    ballots <- data |> pull(ballots)
+
+  }
+
+
+  data <-
+    tibble(candidacies, ballots) |>
+    mutate("porc_ballots" = ballots/(sum(ballots) + first(blank_ballots)))
+
+  data_filtered <-
+    data |>
+    filter(porc_ballots >= threshold)
+
+  divisor_dean <- function(s)
+    if_else(s == 0, 1,
+            (2 * s * (s + 1)) / (2 * s + 1))
+
+  divisors <- map_dbl(0:(n_seats - 1), divisor_dean)
+
+  quotients <- pmap_dfr(
+    list(candidacies = data_filtered$candidacies, v = data_filtered$ballots),
+    function(candidacies, v) {
+      tibble(
+        candidacies = candidacies,
+        divisor  = divisors,
+        quotient = v / divisors
+      )
+    }
+  )
+
+  # top quotients
+  top_quotients <-
+    quotients |>
+    left_join(data, by = "candidacies") |>
+    # in case of ties -> by ballots
+    arrange(desc(quotient), desc(ballots)) |>
+    slice(1:n_seats) |>
+    select(candidacies, divisor, quotient)
+
+  # seats
+  seats <-
+    top_quotients |>
+    count(candidacies, name = "seats") |>
+    arrange(desc(seats)) |>
+    full_join(tibble(candidacies), by = "candidacies") |>
+    mutate("seats" = if_else(is.na(seats), 0, seats)) |>
+    full_join(data, by = "candidacies")
+
+
+
+  if (short_version) {
+
+    return(seats |> select(candidacies, ballots, seats))
+
+  } else {
+
+    seats <-
+      seats |>
+      left_join(quotients |>
+                  pivot_wider(names_from = divisor,
+                              values_from = quotient),
+                by = "candidacies") |>
+      set_names(c("candidacies", "seats", "ballots",
+                  "porc_ballots", paste0("quotient_", 1:n_seats))) |>
+      mutate("porc_seats" = 100*seats/sum(seats),
+             "porc_ballots" = 100*porc_ballots,
+             .after = ballots)
+
+    return(seats)
+  }
+}
+```
+
+```{r}
+# ADAMS
+
+adams_seats <- function(candidacies, ballots, blank_ballots, n_seats,
+                        threshold = 0.03, short_version = TRUE) {
+
+  if (length(unique(candidacies)) != length(candidacies)) {
+
+    data <-
+      tibble(candidacies, ballots) |>
+      summarise(ballots = sum(ballots, na.rm = TRUE), .by = candidacies)
+
+    candidacies <- data |> pull(candidacies)
+    ballots <- data |> pull(ballots)
+
+  }
+
+  data <-
+    tibble(candidacies, ballots) |>
+    mutate("porc_ballots" = ballots/(sum(ballots) + first(blank_ballots)))
+
+  data_filtered <- data |> 
+    filter(porc_ballots >= threshold) |> 
+    select(candidacies, ballots, porc_ballots)
+
+
+  initial_seats <- data_filtered |>
+    arrange(desc(ballots)) |>
+    mutate("initial_seats" = if_else(row_number() <= n_seats, 1, NA))
+
+  remaining_seats <- n_seats - nrow(initial_seats)
+
+  if (remaining_seats <= 0) {
+
+    if (short_version){
+
+    initial_seats <- initial_seats |>
+      full_join(tibble(candidacies), by = "candidacies") |>
+      mutate("seats" = if_else(is.na(initial_seats), 0, initial_seats))
+
+    return(initial_seats |> select(candidacies, ballots, seats))
+
+    } else {
+
+      initial_seats <- initial_seats |>
+        full_join(tibble(candidacies), by = "candidacies") |>
+        mutate("seats" = if_else(is.na(initial_seats), 0, initial_seats)) |>
+        mutate("porc_seats" = 100*seats/sum(seats),
+               "porc_ballots" = 100*porc_ballots,
+               .after = ballots)
+
+      return(initial_seats |> select(-initial_seats))
+
+    }
+
+  }
+
+  divisors <- 1:remaining_seats
+
+  quotients <- pmap_dfr(
+    list(candidacies = data_filtered$candidacies, v = data_filtered$ballots),
+    function(candidacies, v) {
+      tibble(
+        candidacies    = candidacies,
+        divisor  = divisors,
+        quotient = v / divisor
+      )
+    }
+  )
+
+  top_quotients <-
+    quotients |>
+    left_join(data, by = "candidacies") |>
+    # in case of ties -> by ballots
+    arrange(desc(quotient), desc(ballots)) |>
+    slice(1:remaining_seats) |>
+    select(candidacies, divisor, quotient)
+
+  extra_seats <- top_quotients |>
+    count(candidacies, name = "extra_seats")
+
+  seats <- initial_seats |>
+    left_join(extra_seats, by = "candidacies") |>
+    mutate(extra_seats = replace_na(extra_seats, 0),
+           seats = initial_seats + extra_seats) |>
+    arrange(desc(seats)) |>
+    full_join(tibble(candidacies), by = "candidacies") |>
+    mutate("seats" = if_else(is.na(seats), 0, seats)) |>
+    full_join(data, by = "candidacies") |>
+    select(-c(ballots.x, porc_ballots.x)) |>
+    relocate(c(ballots.y, porc_ballots.y), .after = candidacies) |>
+    rename("ballots" = "ballots.y",
+           "porc_ballots" = "porc_ballots.y")
+
+  if (short_version) {
+
+    return(seats |>  select(candidacies, ballots, seats))
+
+  } else {
+
+    seats <-
+      seats |>
+      left_join(quotients |>
+                  pivot_wider(names_from = divisor,
+                              values_from = quotient),
+                by = "candidacies") |>
+      select(-c(initial_seats, extra_seats)) |>
+      set_names(c("candidacies", "ballots",
+                  "porc_ballots", "seats", paste0("quotient_", 1:remaining_seats))) |>
+      mutate("porc_seats" = 100*seats/sum(seats),
+             "porc_ballots" = 100*porc_ballots,
+             .after = ballots)
+
+    return(seats)
+  }
+}
+```
+
+```{r}
+# FIRST-PAST-THE-POST
+
+fptp_seats <- function(candidacies, ballots, blank_ballots,
+                       n_seats, threshold = 0.03, short_version = TRUE) {
+
+  if (length(unique(candidacies)) != length(candidacies)) {
+
+    data <-
+      tibble(candidacies, ballots) |>
+      summarise(ballots = sum(ballots, na.rm = TRUE), .by = candidacies)
+
+    candidacies <- data |> pull(candidacies)
+    ballots <- data |> pull(ballots)
+
+  }
+
+  data <-
+    tibble(candidacies, ballots) |>
+    mutate("porc_ballots" = ballots/(sum(ballots) + first(blank_ballots)))
+
+  data_filtered <-
+    data |>
+    filter(porc_ballots >= threshold)
+
+  top_votes <- max(data_filtered$ballots)
+  tied      <- data_filtered |> filter(ballots == top_votes)
+
+  winner <- tied |> slice_sample(n = 1) # In case of a tie result
+
+  seats <- data |>
+    mutate(seats = if_else(candidacies == winner$candidacies, n_seats, 0)) |>
+    arrange(desc(seats))
+
+  if (short_version) {
+
+    return(seats |>  select(candidacies, ballots, seats))
+
+  } else {
+
+    seats <- seats |>
+      mutate("porc_seat" = 100*seats/sum(seats), .after = seats)
+
+    return(seats)
+
+  }
+}
+
+```
+
+# Total seats
+
+In order to apply the apportionment methods at the provincial level, we need to know how many seats correspond to each province in each election year. For this purpose, we created the total_seats table, which records the number of seats assigned to every province across elections.
+
+This table will be used as an input when running the function allocate_seats_by_prov().
+
+```{r}
+seats_1982 <- tibble(
+  prov = c("Almería", "Cádiz", "Córdoba", "Granada", "Huelva", "Jaén", 
+               "Málaga", "Sevilla", "Huesca", "Teruel", "Zaragoza", "Asturias",
+               "Islas Baleares/Illes Balears", "Las Palmas", "Santa Cruz de Tenerife", 
+               "Cantabria", "Albacete", "Ciudad Real", "Cuenca", "Guadalajara",
+               "Toledo", "Ávila", "Burgos", "León", "Palencia", "Salamanca", 
+               "Segovia", "Soria", "Valladolid", "Zamora", "Barcelona", "Girona",
+               "Lleida", "Tarragona", "Ceuta", "Alicante/Alacant", "Castellón/Castelló", "Valencia/València",
+               "Badajoz", "Cáceres", "La Coruña/A Coruña", "Lugo", "Orense/Ourense", "Pontevedra",
+               "La Rioja", "Madrid", "Melilla", "Murcia", "Navarra/Nafarroa", "Álava/Araba",
+               "Guipúzcoa/Gipuzkoa", "Vizcaya/Bizkaia"),
+  seats = c(5, 8, 7, 7, 5, 7, 8, 12, 3, 3, 8, 10, 6, 6, 7, 5, 4, 5, 4, 3, 5, 3, 4, 
+            6, 3, 4, 3, 3, 5, 4, 33, 5, 4, 5, 1, 9, 5, 15, 7, 5, 9, 5, 5, 8, 4, 32,
+            1, 8, 5, 4, 7, 10),
+  election = 1982)
+
+seats_1986 <- tibble(
+  prov = c("Álava/Araba", "Albacete", "Alicante/Alacant", "Almería", "Asturias", "Ávila", 
+               "Badajoz", "Islas Baleares/Illes Balears", "Barcelona", "Burgos", "Cáceres", "Cádiz", 
+               "Cantabria", "Castellón/Castelló", "Ciudad Real", "Córdoba", "La Coruña/A Coruña",
+               "Cuenca", "Girona", "Granada", "Guadalajara", "Guipúzcoa/Gipuzkoa", "Huelva", 
+               "Huesca", "Jaén", "León", "Lleida", "Lugo", "Madrid", "Málaga", "Murcia",
+               "Navarra/Nafarroa", "Orense/Ourense", "Palencia", "Las Palmas", "Pontevedra", "La Rioja",
+               "Salamanca", "Santa Cruz de Tenerife", "Segovia", "Sevilla", "Soria",
+               "Tarragona", "Teruel", "Toledo", "Valencia/València", "Valladolid", "Vizcaya/Bizkaia",
+               "Zamora", "Zaragoza", "Ceuta", "Melilla" ),
+  seats = c(4, 4, 10, 5, 9, 3, 6, 6, 33, 4, 5, 9, 5, 5, 5, 7, 9, 3, 5, 7, 3, 7, 5, 3,
+            6, 5, 4, 5, 33, 9, 8, 5, 5, 3, 7, 8, 4, 4, 6, 3, 12, 3, 5, 3, 5, 16, 5,
+            10, 4, 8, 1, 1),
+  election = 1986)
+
+seats_1989 <- tibble(
+  prov = c("Almería", "Cádiz", "Córdoba", "Granada", "Huelva", "Jaén", 
+               "Málaga", "Sevilla", "Huesca", "Teruel", "Zaragoza", "Asturias",
+               "Islas Baleares/Illes Balears", "Las Palmas", "Santa Cruz de Tenerife", 
+               "Cantabria", "Albacete", "Ciudad Real", "Cuenca", "Guadalajara",
+               "Toledo", "Ávila", "Burgos", "León", "Palencia", "Salamanca", 
+               "Segovia", "Soria", "Valladolid", "Zamora", "Barcelona", "Girona",
+               "Lleida", "Tarragona", "Ceuta", "Alicante/Alacant", "Castellón/Castelló", "Valencia/València",
+               "Badajoz", "Cáceres", "La Coruña/A Coruña", "Lugo", "Orense/Ourense", "Pontevedra",
+               "La Rioja", "Madrid", "Melilla", "Murcia", "Navarra/Nafarroa", "Álava/Araba",
+               "Guipúzcoa/Gipuzkoa", "Vizcaya/Bizkaia"),
+  seats = c(5, 9, 7, 7, 5, 6, 10, 12, 3, 3, 7, 9, 6, 7, 7, 5, 4, 5, 3, 3, 5, 3, 4, 
+            5, 3, 4, 3, 3, 5, 3, 32, 5, 4, 5, 1, 10, 5, 16, 6, 5, 9, 5, 5, 8, 4, 33,
+            1, 9, 5, 4, 7, 10),
+  election = 1989)
+
+seats_1993 <- tibble(
+  prov = c("Almería", "Cádiz", "Córdoba", "Granada", "Huelva", "Jaén", 
+               "Málaga", "Sevilla", "Huesca", "Teruel", "Zaragoza", "Asturias",
+               "Islas Baleares/Illes Balears", "Las Palmas", "Santa Cruz de Tenerife", 
+               "Cantabria", "Albacete", "Ciudad Real", "Cuenca", "Guadalajara",
+               "Toledo", "Ávila", "Burgos", "León", "Palencia", "Salamanca", 
+               "Segovia", "Soria", "Valladolid", "Zamora", "Barcelona", "Girona",
+               "Lleida", "Tarragona", "Ceuta", "Alicante/Alacant", "Castellón/Castelló", "Valencia/València",
+               "Badajoz", "Cáceres", "La Coruña/A Coruña", "Lugo", "Orense/Ourense", "Pontevedra",
+               "La Rioja", "Madrid", "Melilla", "Murcia", "Navarra/Nafarroa", "Álava/Araba",
+               "Guipúzcoa/Gipuzkoa", "Vizcaya/Bizkaia"),
+  seats = c(5, 9, 7, 7, 5, 6, 10, 12, 3, 3, 7, 9, 7, 7, 7, 5, 4, 5, 3, 3, 5, 3, 4, 
+            5, 3, 4, 3, 3, 5, 3, 32, 5, 4, 6, 1, 10, 5, 16, 6, 5, 9, 5, 4, 8, 4, 34,
+            1, 9, 5, 4, 6, 10),
+  election = 1993)
+
+seats_1996 <- tibble(
+  prov = c("Álava/Araba", "Albacete", "Alicante/Alacant", "Almería", "Asturias", "Ávila", 
+               "Badajoz", "Islas Baleares/Illes Balears", "Barcelona", "Burgos", "Cáceres", "Cádiz", 
+               "Cantabria", "Castellón/Castelló", "Ceuta", "Ciudad Real", "Córdoba", "La Coruña/A Coruña",
+               "Cuenca", "Girona", "Granada", "Guadalajara", "Guipúzcoa/Gipuzkoa", "Huelva", 
+               "Huesca", "Jaén", "León", "Lleida", "Lugo", "Madrid", "Málaga", "Melilla", "Murcia", "Navarra/Nafarroa", "Orense/Ourense", "Palencia", "Las Palmas", "Pontevedra", "La Rioja",
+               "Salamanca", "Santa Cruz de Tenerife", "Segovia", "Sevilla", "Soria",
+               "Tarragona", "Teruel", "Toledo", "Valencia/València", "Valladolid", "Vizcaya/Bizkaia",
+               "Zamora", "Zaragoza"),
+  seats = c(4, 4, 11, 5, 9, 3, 6, 7, 31, 4, 5, 9, 5, 5, 1, 5, 7, 9, 3, 5, 7, 3, 6, 5, 3,
+            6, 5, 4, 4, 34, 10, 1, 9, 5, 4, 3, 7, 8, 4, 4, 7, 3, 13, 3, 6, 3, 5, 16, 5,
+            9, 3, 7),
+  election = 1996)
+
+seats_2000 <- tibble(
+  prov = c("Almería", "Cádiz", "Córdoba", "Granada", "Huelva", "Jaén", 
+               "Málaga", "Sevilla", "Huesca", "Teruel", "Zaragoza", "Asturias",
+               "Islas Baleares/Illes Balears", "Las Palmas", "Santa Cruz de Tenerife", 
+               "Cantabria", "Albacete", "Ciudad Real", "Cuenca", "Guadalajara",
+               "Toledo", "Ávila", "Burgos", "León", "Palencia", "Salamanca", 
+               "Segovia", "Soria", "Valladolid", "Zamora", "Barcelona", "Girona",
+               "Lleida", "Tarragona", "Ceuta", "Alicante/Alacant", "Castellón/Castelló", "Valencia/València",
+               "Badajoz", "Cáceres", "La Coruña/A Coruña", "Lugo", "Orense/Ourense", "Pontevedra",
+               "La Rioja", "Madrid", "Melilla", "Murcia", "Navarra/Nafarroa", "Álava/Araba",
+               "Guipúzcoa/Gipuzkoa", "Vizcaya/Bizkaia"),
+  seats = c(5, 9, 7, 7, 5, 6, 10, 13, 3, 3, 7, 9, 7, 7, 7, 5, 4, 5, 3, 3, 5, 3, 4, 
+            5, 3, 4, 3, 3, 5, 3, 31, 5, 4, 6, 1, 11, 5, 16, 6, 5, 9, 4, 4, 8, 4, 34,
+            1, 9, 5, 4, 6, 9),
+  election = 2000)
+
+seats_2004 <- tibble(
+  prov = c("Almería", "Cádiz", "Córdoba", "Granada", "Huelva", "Jaén", 
+               "Málaga", "Sevilla", "Huesca", "Teruel", "Zaragoza", "Asturias",
+               "Islas Baleares/Illes Balears", "Las Palmas", "Santa Cruz de Tenerife", 
+               "Cantabria", "Albacete", "Ciudad Real", "Cuenca", "Guadalajara",
+               "Toledo", "Ávila", "Burgos", "León", "Palencia", "Salamanca", 
+               "Segovia", "Soria", "Valladolid", "Zamora", "Barcelona", "Girona",
+               "Lleida", "Tarragona", "Ceuta", "Alicante/Alacant", "Castellón/Castelló", "Valencia/València",
+               "Badajoz", "Cáceres", "La Coruña/A Coruña", "Lugo", "Orense/Ourense", "Pontevedra",
+               "La Rioja", "Madrid", "Melilla", "Murcia", "Navarra/Nafarroa", "Álava/Araba",
+               "Guipúzcoa/Gipuzkoa", "Vizcaya/Bizkaia"),
+  seats = c(5, 9, 7, 7, 5, 6, 10, 12, 3, 3, 7, 8, 8, 8, 7, 5, 4, 5, 3, 3, 5, 3, 4, 
+            5, 3, 4, 3, 3, 5, 3, 31, 6, 4, 6, 1, 11, 5, 16, 6, 4, 9, 4, 4, 7, 4, 35,
+            1, 9, 5, 4, 6, 9),
+  election = 2004)
+
+seats_2008 <- tibble(
+  prov = c("Almería", "Cádiz", "Córdoba", "Granada", "Huelva", "Jaén", 
+               "Málaga", "Sevilla", "Huesca", "Teruel", "Zaragoza", "Asturias",
+               "Islas Baleares/Illes Balears", "Las Palmas", "Santa Cruz de Tenerife", 
+               "Cantabria", "Albacete", "Ciudad Real", "Cuenca", "Guadalajara",
+               "Toledo", "Ávila", "Burgos", "León", "Palencia", "Salamanca", 
+               "Segovia", "Soria", "Valladolid", "Zamora", "Barcelona", "Girona",
+               "Lleida", "Tarragona", "Ceuta", "Alicante/Alacant", "Castellón/Castelló", "Valencia/València",
+               "Badajoz", "Cáceres", "La Coruña/A Coruña", "Lugo", "Orense/Ourense", "Pontevedra",
+               "La Rioja", "Madrid", "Melilla", "Murcia", "Navarra/Nafarroa", "Álava/Araba",
+               "Guipúzcoa/Gipuzkoa", "Vizcaya/Bizkaia"),
+  seats = c(6, 9, 6, 7, 5, 6, 10, 12, 3, 3, 7, 8, 8, 8, 7, 5, 4, 5, 3, 3, 6, 3, 4, 
+            5, 3, 4, 3, 2, 5, 3, 31, 6, 4, 6, 1, 12, 5, 16, 6, 4, 8, 4, 4, 7, 4, 35,
+            1, 10, 5, 4, 6, 8),
+  election = 2008)
+
+
+seats_2011 <- tibble(
+  prov = c("Álava/Araba", "Albacete", "Alicante/Alacant", "Almería", "Asturias", "Ávila", 
+               "Badajoz", "Islas Baleares/Illes Balears", "Barcelona", "Burgos", "Cáceres", "Cádiz", 
+               "Cantabria", "Castellón/Castelló", "Ciudad Real", "Córdoba", "La Coruña/A Coruña",
+               "Cuenca", "Girona", "Granada", "Guadalajara", "Guipúzcoa/Gipuzkoa", "Huelva", 
+               "Huesca", "Jaén", "León", "Lleida", "Lugo", "Madrid", "Málaga", "Murcia", 
+               "Navarra/Nafarroa", "Orense/Ourense", "Palencia", "Las Palmas", "Pontevedra", "La Rioja",
+               "Salamanca", "Santa Cruz de Tenerife", "Segovia", "Sevilla", "Soria",
+               "Tarragona", "Teruel", "Toledo", "Valencia/València", "Valladolid", "Vizcaya/Bizkaia",
+               "Zamora", "Zaragoza", "Ceuta",  "Melilla"),
+  seats = c(4, 4, 12, 6, 8, 3, 6, 8, 31, 4, 4, 8, 5, 5, 5, 6, 8, 3, 6, 7, 3, 6, 5, 3,
+            6, 5, 4, 4, 36, 10, 10, 5, 4, 3, 8, 7, 4, 4, 7, 3, 12, 2, 6, 3, 6, 16, 5,
+            8, 3, 7, 1, 1),
+  election = 2011)
+
+seats_2015 <- tibble(
+  prov = c("Álava/Araba", "Albacete", "Alicante/Alacant", "Almería", "Asturias", "Ávila", 
+               "Badajoz", "Islas Baleares/Illes Balears", "Barcelona", "Burgos", "Cáceres", "Cádiz", 
+               "Cantabria", "Castellón/Castelló", "Ceuta", "Ciudad Real", "Córdoba", "La Coruña/A Coruña",
+               "Cuenca", "Girona", "Granada", "Guadalajara", "Guipúzcoa/Gipuzkoa", "Huelva", 
+               "Huesca", "Jaén", "León", "Lleida", "Lugo", "Madrid", "Málaga", "Melilla", "Murcia", "Navarra/Nafarroa", "Orense/Ourense", "Palencia", "Las Palmas", "Pontevedra", "La Rioja",
+               "Salamanca", "Santa Cruz de Tenerife", "Segovia", "Sevilla", "Soria",
+               "Tarragona", "Teruel", "Toledo", "Valencia/València", "Valladolid", "Vizcaya/Bizkaia",
+               "Zamora", "Zaragoza"),
+  seats = c(4, 4, 12, 6, 8, 3, 6, 8, 31, 4, 4, 9, 5, 5, 1, 5, 6, 8, 3, 6, 7, 3, 6, 5, 3,
+            5, 5, 4, 4, 36, 11, 1, 10, 5, 4, 3, 8, 7, 4, 4, 7, 3, 12, 2, 6, 3, 6, 15, 5,
+            8, 3, 7),
+  election = 2015)
+
+seats_2016 <- tibble(
+  prov = c("Álava/Araba", "Albacete", "Alicante/Alacant", "Almería", "Asturias", "Ávila", 
+               "Badajoz", "Islas Baleares/Illes Balears", "Barcelona", "Burgos", "Cáceres", "Cádiz", 
+               "Cantabria", "Castellón/Castelló", "Ceuta", "Ciudad Real", "Córdoba", "La Coruña/A Coruña",
+               "Cuenca", "Girona", "Granada", "Guadalajara", "Guipúzcoa/Gipuzkoa", "Huelva", 
+               "Huesca", "Jaén", "León", "Lleida", "Lugo", "Madrid", "Málaga", "Melilla", "Murcia", "Navarra/Nafarroa", "Orense/Ourense", "Palencia", "Las Palmas", "Pontevedra", "La Rioja",
+               "Salamanca", "Santa Cruz de Tenerife", "Segovia", "Sevilla", "Soria",
+               "Tarragona", "Teruel", "Toledo", "Valencia/València", "Valladolid", "Vizcaya/Bizkaia",
+               "Zamora", "Zaragoza"),
+  seats = c(4, 4, 12, 6, 8, 3, 6, 8, 31, 4, 4, 9, 5, 5, 1, 5, 6, 8, 3, 6, 7, 3, 6, 5, 3,
+            5, 4, 4, 4, 36, 11, 1, 10, 5, 4, 3, 8, 7, 4, 4, 7, 3, 12, 2, 6, 3, 6, 16, 5,
+            8, 3, 7),
+  election = 2016)
+
+seats_2019 <- tibble(
+  prov = c("Álava/Araba", "Albacete", "Alicante/Alacant", "Almería", "Asturias", "Ávila", 
+               "Badajoz", "Islas Baleares/Illes Balears", "Barcelona", "Burgos", "Cáceres", "Cádiz", 
+               "Cantabria", "Castellón/Castelló", "Ceuta", "Ciudad Real", "Córdoba", "La Coruña/A Coruña",
+               "Cuenca", "Girona", "Granada", "Guadalajara", "Guipúzcoa/Gipuzkoa", "Huelva", 
+               "Huesca", "Jaén", "León", "Lleida", "Lugo", "Madrid", "Málaga", "Melilla", "Murcia", "Navarra/Nafarroa", "Orense/Ourense", "Palencia", "Las Palmas", "Pontevedra", "La Rioja",
+               "Salamanca", "Santa Cruz de Tenerife", "Segovia", "Sevilla", "Soria",
+               "Tarragona", "Teruel", "Toledo", "Valencia/València", "Valladolid", "Vizcaya/Bizkaia",
+               "Zamora", "Zaragoza"),
+  seats = c(4, 4, 12, 6, 7, 3, 6, 8, 32, 4, 4, 9, 5, 5, 1, 5, 6, 8, 3, 6, 7, 3, 6, 5, 3,
+            5, 4, 4, 4, 37, 11, 1, 10, 5, 4, 3, 8, 7, 4, 4, 7, 3, 12, 2, 6, 3, 6, 15, 5,
+            8, 3, 7),
+  election = 2019)
+
+
+seats_2023 <- tibble(
+  prov = c("Madrid", "Barcelona", "Valencia/València", "Alicante/Alacant", "Sevilla", "Málaga", 
+               "Murcia", "Cádiz", "La Coruña/A Coruña", "Vizcaya/Bizkaia", "Islas Baleares/Illes Balears", "Las Palmas", 
+               "Asturias", "Granada", "Pontevedra", "Santa Cruz de Tenerife", "Zaragoza",
+               "Almería", "Córdoba", "Girona", "Guipúzcoa/Gipuzkoa", "Tarragona", "Toledo", 
+               "Badajoz", "Cantabria", "Castellón/Castelló", "Ciudad Real", "Huelva", "Jaén", 
+               "Navarra/Nafarroa", "Valladolid","Álava/Araba", "Albacete", "Burgos", "Cáceres", "León",
+               "Lleida", "Lugo", "Orense/Ourense", "La Rioja", "Salamanca", "Ávila", "Cuenca",
+               "Guadalajara", "Huesca", "Palencia", "Segovia", "Teruel", "Zamora",
+               "Soria", "Ceuta", "Melilla"),
+  seats = c(37, 32, 16, 12, 12, 11, 10, 9, 8, 8, 8, 8, 7, 7, 7, 7, 7, 6, 6, 6, 6, 6, 6, 
+            5, 5, 5, 5, 5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 
+            2, 1, 1),
+  election = 2023
+)
+
+total_seats <-  bind_rows(seats_1982, seats_1986, seats_1989, seats_1993, seats_1996, 
+                          seats_2000, seats_2004, seats_2008, 
+                          seats_2011, seats_2015, seats_2016, seats_2019, seats_2023)
+
+```
+
+# Methods of disproportionality
+
+Before presenting the results of the different electoral simulations, which vary legal thresholds, apportionment methods, or constituency structures, it is necessary to establish standardized criteria to measure and compare the degree of proportionality. For this purpose, we rely on a set of disproportionality indices widely used in the study of electoral systems.
+
+These indices quantify how closely the distribution of parliamentary seats reflects the distribution of votes, allowing us to evaluate and compare outcomes across all scenarios tested. In other words, they provide a systematic way of ranking each simulation according to its level of proportionality.
+
+The following section introduces the main indices employed, presenting their formulas and interpretative logic. Although all of them compare vote shares with seat shares, each emphasizes different aspects: some capture overall deviations, others highlight the largest distortions, and others focus on relative overrepresentation.
+
+## Gallagher
+
+The Gallagher index, also known as the Least Squares Index, is computed as the square root of half the sum of squared differences between the percentage of votes and the percentage of seats obtained by each party. The formula:
+
+𝐼𝐺 = √(1/2) ∑ (𝑣𝑖 − 𝑠𝑖)^2
+
+The division by 2 gives an index whose values range between 0 and 100. The larger the differences between the percentage of the votes and the percentage of seats summed over all parties, the larger the Gallagher index. 
+
+## Loosemore-Hanby
+
+The Loosemore–Hanby index calculates disproportionality as the sum of absolute differences between vote shares and seat shares, divided by two:
+
+𝐼𝐿𝐻 = (1/2) ∑ |𝑣𝑖 −𝑠𝑖|
+
+where vi is the vote share and si the seat share of party i.
+
+The division by two avoids double-counting, since overrepresentation of some parties necessarily corresponds to underrepresentation of others. The result has a clear interpretation: it represents the proportion of seats that would need to change hands between parties in order to achieve perfect proportionality.
+
+## Sainte-Laguë Index
+
+The Sainte-Laguë index measures disproportionality as the weighted squared deviation of the seat-to-vote ratio from the ideal of one:
+
+𝐼𝑆𝐿 = ∑ 𝑣𝑖 ((𝑠𝑖/𝑣𝑖)− 1)^2
+
+where Vi is fraction of votes and Si is fraction of seats for each of the political parties. By weighting deviations by vote share, it gives more importance to distortions affecting larger parties. As well as the previous indices, higher values indicate less proportional outcomes.
+
+## Rae's Index
+
+It uses the average of the deviations. In fact, it sums the absolute differences between vote percentages (vi) and seat percentages (si) and the outcome is divided by the number of the political parties (n): 
+
+I = (1/n) ∑ |vi − si|
+
+## Lijpart Index
+
+The Lijphart index takes the maximum deviation between any party’s vote share and seat share:
+
+ max |vi − si| 
+ 
+It reflects the extent of overrepresentation of the most advantaged party.
+
+### D'Hondt Index
+
+The D’Hondt index considers the ratio of seat share to vote share for the most overrepresented party. Thus, it is given by
+
+ max (si / vi)
+ 
+A value of one indicates perfect proportionality, while larger values reflect increasing advantage for the leading party.
+
+
+All of these indices have been implemented as R functions that take vote and seat distributions as input. This allows us to systematically score each electoral scenario using consistent and comparable metrics, helping us analyze the proportionality outcomes of our different simulations in detail:
+
+```{r}
+#Measures of disproportionality
+
+calculate_disproportionality_indices <- function(votes, seats) {
+  
+  to_percentage <- function(x) {
+    100 * x / sum(x)
+  }
+  
+  votes_pct <- to_percentage(votes)
+  seats_pct <- to_percentage(seats)
+  
+  # Only parties with votes > 0
+  valid <- votes_pct > 0
+  
+  #Gallagher
+  gallagher <- sqrt(0.5 * sum((votes_pct - seats_pct)^2))
+  
+  #Loosemore_handy
+  loosemore_hanby <- 0.5 * sum(abs(votes_pct - seats_pct))
+  
+  #rae's
+  rae <- mean(abs(votes_pct - seats_pct))
+  
+  #Lipjart
+  lijphart <- max(abs(votes_pct - seats_pct))
+  
+  # Sainte-Laguë
+  saint_lague <- sum(votes_pct[valid] * ((seats_pct[valid] / votes_pct[valid] - 1)^2))
+  
+  #D'hondt
+  dhondt <- max(seats_pct[valid] / votes_pct[valid])
+  
+  
+  return(list(
+    "Gallagher" = gallagher,
+    "Loosemore-Hanby" = loosemore_hanby,
+    "Sainte-Laguë" = saint_lague,
+    "Rae's" = rae,
+    "Lijphart" = lijphart,
+    "D'Hondt" = dhondt
+  ))
+}
+```
+
+# Analysis
+
+## Current electoral system: D'Hondt method with provincial constituencies and 0.03 threshold
+
+We begin by analyzing the seat distribution under Spain’s current electoral system, which uses the D’Hondt method, applies provincial-level districts, and imposes a 3% legal threshold within each constituency. The goal is to establish a baseline scenario that we will later subject to disproportionality measures, providing a point of comparison for alternative electoral designs such as different apportionment methods, threshold rules, or district structures. 
+
+To do so, we download provincial-level election data for all general elections since 1982 using the pollspain package:
+
+```{r}
+e2023prov <- summary_election_data(type_elec = "congress", year = 2023, level = "prov")
+e2016prov <- summary_election_data(type_elec = "congress", year = 2016, level = "prov")
+e2015prov <- summary_election_data(type_elec = "congress", year = 2015, level = "prov")
+e2011prov <- summary_election_data(type_elec = "congress", year = 2011, level = "prov")
+e2008prov <- summary_election_data(type_elec = "congress", year = 2008, level = "prov")
+e2004prov <- summary_election_data(type_elec = "congress", year = 2004, level = "prov")
+e2000prov <- summary_election_data(type_elec = "congress", year = 2000, level = "prov")
+e1996prov <- summary_election_data(type_elec = "congress", year = 1996, level = "prov")
+e1993prov <- summary_election_data(type_elec = "congress", year = 1993, level = "prov")
+e1989prov <- summary_election_data(type_elec = "congress", year = 1989, level = "prov")
+e1986prov <- summary_election_data(type_elec = "congress", year = 1986, level = "prov")
+e1982prov <- summary_election_data(type_elec = "congress", year = 1982, level = "prov")
+```
+
+
+```{r}
+e2019Aprov <- summary_election_data(type_elec = "congress", date = "2019-04-28", level = "prov")
+e2019Nprov <- summary_election_data(type_elec = "congress", date = "2019-11-10", level = "prov")
+```
+
+We first define a general-purpose function, allocate_seats(), that can be applied to any apportionment method and under any electoral threshold. This makes the code highly flexible and reusable for exploring a wide range of electoral system configurations.
+
+What makes this function robust and versatile is its ability to:
+
+- Automatically detect the appropriate party identifier, depending on the electoral data level. Provincial datasets include the variable id_candidacies_nat, which comes from our harmonized party dictionary. However, when working at level = "all" and level = "ccaa", this variable may appear under the name id_candidacies.
+- Delegate the apportionment logic to the relevant method-specific function based on the method argument passed.
+- Return a standardized output that includes party IDs, abbreviated names, vote totals, and allocated seats.
+
+This level of abstraction ensures that the function can be reused across all simulations conducted in this thesis, allowing for consistent comparisons between different electoral rules.
+
+```{r}
+allocate_seats <- function(data, method = "dhondt", threshold = 0.03, nseats, short_version = TRUE) {
+
+  if ("id_candidacies_nat" %in% names(data)) {
+    party_var <- "id_candidacies_nat"
+  } else {
+    party_var <- "id_candidacies"
+  }
+  abbrev_var <- "abbrev_candidacies"
+
+  party <- data[[party_var]]
+  votes <- data$ballots
+  blank_votes <- first(data$blank_ballots)
+
+  if (anyDuplicated(party)) {
+    data <- data |>
+      group_by(.data[[party_var]]) |>
+      summarise(
+        ballots = sum(ballots, na.rm = TRUE),
+        blank_ballots = first(blank_ballots),
+        abbrev_candidacies = first(abbrev_candidacies),
+        .groups = "drop"
+      )
+    party <- data[[party_var]]
+    votes <- data$ballots
+    blank_votes <- first(data$blank_ballots)
+  }
+
+  method_fun <- switch(
+    tolower(method),
+    "dhondt"     = dhondt_seats,
+    "webster"    = webster_seats,
+    "hamilton"   = hamilton_seats,
+    "adams"      = adams_seats,
+    "dean"       = deans_seats,
+    "deans"      = deans_seats,
+    "huntington" = hill_seats,
+    "hill"       = hill_seats,
+    "hagenbach"  = hagenbach_bischoff_seats,
+    "fptp"       = function(...) fptp_seats(...),
+    stop("Unrecognized allocation method.")
+  )
+
+
+  result <- if (method == "fptp") {
+    method_fun(party, votes, blank_votes, nseats)
+  } else if (method %in% c("hamilton", "hagenbach")) {
+    method_fun(party, votes, blank_votes, nseats, short_version = short_version)
+  } else {
+    method_fun(party, votes, blank_votes, nseats, threshold, short_version)
+  }
+
+  
+  if (!short_version && is.list(result)) {
+    result <- result$seats
+  }
+
+
+  result <- result |>
+    left_join(
+      data |> select(all_of(party_var), all_of(abbrev_var)),
+      by = c("candidacies" = party_var)
+    ) |>
+    relocate(abbrev_candidacies, .after = candidacies) |>
+    arrange(desc(ballots)) |>
+    rename(
+      !!party_var := candidacies,
+      total_ballots = ballots,
+      total_seats = seats
+    )
+
+  return(result)
+}
+```
+
+To apply this logic at the provincial level, we define the function allocate_seats_by_prov(). This function automates the seat allocation process within each province, using the number of seats assigned to each province (provided in the total_seats table). It groups the election data by both province and year, and for each group, it calls the previously defined allocate_seats() function. This modular design allows us to simulate national results from provincial data in a consistent and scalable way.
+
+```{r}
+allocate_seats_by_prov <- function(data, total_seats_prov, method = "dhondt", threshold = 0.03, short_version = TRUE) {
+
+  if (!"election" %in% names(data)) {
+    data <- data |>
+      mutate(election = str_extract(id_elec, "\\d{4}"))
+  }
+
+  total_seats_prov <- total_seats_prov |>
+    mutate(
+      election = as.character(election),
+      prov = str_trim(prov)
+    )
+
+  data <- data |>
+    mutate(
+      election = as.character(election),
+      prov = str_trim(prov)
+    )
+
+  results <- data |>
+    group_split(election, prov) |>
+    map_dfr(function(df) {
+      elec <- str_trim(unique(df$election))
+      provincia <- str_trim(unique(df$prov))
+
+      nseats <- total_seats_prov |>
+        filter(prov == provincia, election == elec) |>
+        pull(seats)
+
+      result <- allocate_seats(
+        data = df,
+        method = method,
+        threshold = threshold,
+        nseats = nseats,
+        short_version = short_version
+      ) |>
+        mutate(prov = provincia)
+
+      return(result)
+    })
+
+  return(results)
+}
+```
+
+We then loop over all election years and apply the D’Hondt allocation rule by province, using the 3% threshold. Each result is summarized at the national level, showing the total number of votes and seats received by each party across all provinces.
+
+This setup allows us to directly observe the distribution of seats under the actual system over time and will later allow us to simulate counterfactuals by changing the apportionment rule or the electoral threshold.
+
+```{r}
+datasets_prov <- list(
+  e2023 = e2023prov,
+  e2019N = e2019Nprov,
+  e2019A = e2019Aprov,
+  e2016 = e2016prov,
+  e2015 = e2015prov,
+  e2011 = e2011prov,
+  e2008 = e2008prov,
+  e2004 = e2004prov,
+  e2000 = e2000prov,
+  e1996 = e1996prov,
+  e1993 = e1993prov,
+  e1989 = e1989prov,
+  e1986 = e1986prov,
+  e1982 = e1982prov
+)
+
+results_prov <- imap(datasets_prov, function(df, name) {
+  
+  formula <- allocate_seats_by_prov(
+    data = df,
+    total_seats = total_seats,
+    method = "dhondt",       
+    threshold = 0.03,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies_nat) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+results_prov$e2023
+```
+
+Finally, we apply the results to the disproportionality indices formula we created previously 
+
+```{r}
+disprop_index_list <- map(results_prov, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+
+disprop_index_list
+```
+
+
+# Electoral outcomes under different thresholds
+
+To begin with our simulations, we analyze how the distribution of seats would change if Spain adopted different legal electoral thresholds.
+
+The aim here is to isolate the impact of the threshold alone, keeping everything else constant: we continue to use the D’Hondt method and the provincial constituencies that define the current system. To do this, we reuse the allocate_seats_by_prov() function, which distributes seats within each province according to the specified threshold and apportionment method.
+
+We begin by exploring the baseline scenario with no threshold (0%) and then progressively raise the barrier to 1%, 2%, 4%, 5%, 7%, and finally 10%.
+
+```{r}
+#Threshold 0.07 
+
+results_prov_0.07 <- imap(datasets_prov, function(df, name) {
+  
+  formula <- allocate_seats_by_prov(
+    data = df,
+    total_seats = total_seats,
+    method = "dhondt",       
+    threshold = 0.07,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies_nat) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+
+results_prov_0.07$e2023
+```
+
+```{r}
+# No formal threshold
+
+results_prov_0 <- imap(datasets_prov, function(df, name) {
+  
+  formula <- allocate_seats_by_prov(
+    data = df,
+    total_seats = total_seats,
+    method = "dhondt",       
+    threshold = 0,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies_nat) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+
+results_prov_0$e2023
+```
+
+
+```{r}
+#Threshold 0.02
+
+results_prov_0.02 <- imap(datasets_prov, function(df, name) {
+  
+  formula <- allocate_seats_by_prov(
+    data = df,
+    total_seats = total_seats,
+    method = "dhondt",       
+    threshold = 0.02,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies_nat) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+
+results_prov_0.02$e2023
+```
+
+```{r}
+#Threshold 0.04
+
+results_prov_0.04 <- imap(datasets_prov, function(df, name) {
+  
+  formula <- allocate_seats_by_prov(
+    data = df,
+    total_seats = total_seats,
+    method = "dhondt",       
+    threshold = 0.04,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies_nat) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+
+results_prov_0.04$e2023
+```
+
+```{r}
+results_prov_0.1 <- imap(datasets_prov, function(df, name) {
+  
+  formula <- allocate_seats_by_prov(
+    data = df,
+    total_seats = total_seats,
+    method = "dhondt",       
+    threshold = 0.1,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies_nat) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+
+results_prov_0.1$e2023
+```
+
+```{r}
+results_prov_0.01 <- imap(datasets_prov, function(df, name) {
+  
+  formula <- allocate_seats_by_prov(
+    data = df,
+    total_seats = total_seats,
+    method = "dhondt",       
+    threshold = 0.01,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies_nat) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+
+results_prov_0.01$e2023
+```
+
+```{r}
+results_prov_0.05 <- imap(datasets_prov, function(df, name) {
+  
+  formula <- allocate_seats_by_prov(
+    data = df,
+    total_seats = total_seats,
+    method = "dhondt",       
+    threshold = 0.05,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies_nat) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+
+results_prov_0.05$e2023
+```
+
+After allocating seats under each scenario, we compute the disproportionality indices to quantify the effect of each threshold level on the proportionality of electoral outcomes.
+
+```{r}
+# Threshold 0.03
+
+disprop_index_0.07 <- map(results_prov_0.07, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+
+disprop_index_0.07
+```
+
+```{r}
+# Threshold 0.04
+
+disprop_index_0.04 <- map(results_prov_0.04, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+
+disprop_index_0.04
+```
+
+```{r}
+# Threshold 0.02
+
+disprop_index_0.02 <- map(results_prov_0.02, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+
+disprop_index_0.02
+```
+
+```{r}
+# No threshold
+
+disprop_index_0 <- map(results_prov_0, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+
+disprop_index_0
+```
+
+```{r}
+# Threshold 0.1
+
+disprop_index_0.1 <- map(results_prov_0.1, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+
+disprop_index_0.1
+```
+
+```{r}
+# Threshold 0.01
+
+disprop_index_0.01 <- map(results_prov_0.01, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+
+disprop_index_0.01
+```
+
+```{r}
+# Threshold 0.05
+
+disprop_index_0.05 <- map(results_prov_0.05, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+
+disprop_index_0.05
+```
+
+# Electoral outcomes under different circumscriptions (Maintaining D’Hondt and a 0.03 threshold)
+
+In this section, we replicate Spain’s electoral system while holding the apportionment method (D’Hondt) and the legal threshold (3%) constant. What varies is the definition of the electoral constituency. Alongside the current provincial system, we simulate alternative territorial aggregations: a single national constituency and regional constituencies based on the Comunidades Autónomas (CCAA). This comparison allows us to isolate how the choice of constituency alone affects party representation and overall proportionality.
+
+## National Level Aggregation
+
+We first retrieve and prepare the national-level election data for all general elections since 1982. These datasets contain total votes per party at the national level and allow us to simulate outcomes as if Spain were a single national district.
+
+```{r}
+e2023nat <- summary_election_data("congress", year = 2023, by_parties = TRUE, level = "all", short_version = FALSE)
+e2016nat <- summary_election_data("congress", year = 2016, by_parties = TRUE, level = "all", short_version = FALSE)
+e2015nat <- summary_election_data("congress", year = 2015, by_parties = TRUE, level = "all", short_version = FALSE)
+e2011nat <- summary_election_data("congress", year = 2011, by_parties = TRUE, level = "all", short_version = FALSE)
+e2008nat <- summary_election_data("congress", year = 2008, by_parties = TRUE, level = "all", short_version = FALSE)
+e2004nat <- summary_election_data("congress", year = 2004, by_parties = TRUE, level = "all", short_version = FALSE)
+e2000nat <- summary_election_data("congress", year = 2000, by_parties = TRUE, level = "all", short_version = FALSE)
+e1996nat <- summary_election_data("congress", year = 1996, by_parties = TRUE, level = "all", short_version = FALSE)
+e1993nat <- summary_election_data("congress", year = 1993, by_parties = TRUE, level = "all", short_version = FALSE)
+e1989nat <- summary_election_data("congress", year = 1989, by_parties = TRUE, level = "all", short_version = FALSE)
+e1986nat <- summary_election_data("congress", year = 1986, by_parties = TRUE, level = "all", short_version = FALSE)
+e1982nat <- summary_election_data("congress", year = 1982, by_parties = TRUE, level = "all", short_version = FALSE)
+```
+
+```{r}
+e2019Anat <- summary_election_data("congress", date = "2019-04-28", by_parties = TRUE, level = "all", short_version = FALSE)
+e2019Nnat <- summary_election_data("congress", date = "2019-11-10", by_parties = TRUE, level = "all", short_version = FALSE)
+
+```
+
+
+Using the allocate_seats() function, which we defined earlier, we now compute the seat allocations for each election. Since this scenario does not require a separate function for grouping by province or region, we can apply allocate_seats() directly to each national dataset. 
+
+```{r}
+datasets_nat <- list(
+  e2023 = e2023nat,
+  e2019N = e2019Nnat,
+  e2019A = e2019Anat,
+  e2016 = e2016nat,
+  e2015 = e2015nat,
+  e2011 = e2011nat,
+  e2008 = e2008nat,
+  e2004 = e2004nat,
+  e2000 = e2000nat,
+  e1996 = e1996nat,
+  e1993 = e1993nat,
+  e1989 = e1989nat,
+  e1986 = e1986nat,
+  e1982 = e1982nat
+)
+
+results_nat <- map(datasets_nat, function(df) {
+  allocate_seats(df, method = "dhondt", threshold = 0.03, nseats = 350)
+})
+
+results_nat$e2023
+```
+
+Once the seats are allocated, we calculate the disproportionality indices to evaluate how proportional the results are under this configuration.
+
+```{r}
+disprop_index_nat <- map(results_nat, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+
+disprop_index_nat
+```
+
+### National Level aggregation with different thresholds
+
+After computing the baseline scenario with the standard 3% electoral threshold, we also explore how results would change under alternative thresholds. To do this, we re-run the seat allocation for each election year using the D’Hondt method but varying the threshold (0%, 1%, 2%, 4%, 5%, 7%, and 10%).
+
+This allows us to examine the impact of different entry barriers on party representation and overall proportionality.
+
+```{r}
+results_nat_0 <- map(datasets_nat, function(df) {
+  allocate_seats(df, method = "dhondt", threshold = 0, nseats = 350)
+})
+
+results_nat_0.01 <- map(datasets_nat, function(df) {
+  allocate_seats(df, method = "dhondt", threshold = 0.01, nseats = 350)
+})
+
+results_nat_0.02 <- map(datasets_nat, function(df) {
+  allocate_seats(df, method = "dhondt", threshold = 0.02, nseats = 350)
+})
+
+results_nat_0.04 <- map(datasets_nat, function(df) {
+  allocate_seats(df, method = "dhondt", threshold = 0.04, nseats = 350)
+})
+
+results_nat_0.05 <- map(datasets_nat, function(df) {
+  allocate_seats(df, method = "dhondt", threshold = 0.05, nseats = 350)
+})
+
+results_nat_0.07 <- map(datasets_nat, function(df) {
+  allocate_seats(df, method = "dhondt", threshold = 0.07, nseats = 350)
+})
+
+results_nat_0.1 <- map(datasets_nat, function(df) {
+  allocate_seats(df, method = "dhondt", threshold = 0.1, nseats = 350)
+})
+```
+
+And again we apply the desproportionality indices formula
+
+```{r}
+disprop_index_nat_0 <- map(results_nat_0, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+disprop_index_nat_0.01 <- map(results_nat_0.01, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+disprop_index_nat_0.02 <- map(results_nat_0.02, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+disprop_index_nat_0.04 <- map(results_nat_0.04, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+disprop_index_nat_0.05 <- map(results_nat_0.05, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+disprop_index_nat_0.07 <- map(results_nat_0.07, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+disprop_index_nat_0.1 <- map(results_nat_0.1, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+```
+
+## Regional Level Aggregation (Comunidades Autónomas)
+
+To move to the regional level, we begin by collecting the election results aggregated at the level of each Comunidad Autónoma (CCAA) across all elections in the dataset.
+
+```{r}
+e2023ccaa <- summary_election_data("congress", year = 2023, by_parties = TRUE, level = "ccaa", short_version = FALSE)
+e2016ccaa <- summary_election_data("congress", year = 2016, by_parties = TRUE, level = "ccaa", short_version = FALSE)
+e2015ccaa <- summary_election_data("congress", year = 2015, by_parties = TRUE, level = "ccaa", short_version = FALSE)
+e2011ccaa <- summary_election_data("congress", year = 2011, by_parties = TRUE, level = "ccaa", short_version = FALSE)
+e2008ccaa <- summary_election_data("congress", year = 2008, by_parties = TRUE, level = "ccaa", short_version = FALSE)
+e2004ccaa <- summary_election_data("congress", year = 2004, by_parties = TRUE, level = "ccaa", short_version = FALSE)
+e2000ccaa <- summary_election_data("congress", year = 2000, by_parties = TRUE, level = "ccaa", short_version = FALSE)
+e1996ccaa <- summary_election_data("congress", year = 1996, by_parties = TRUE, level = "ccaa", short_version = FALSE)
+e1993ccaa <- summary_election_data("congress", year = 1993, by_parties = TRUE, level = "ccaa", short_version = FALSE)
+e1989ccaa <- summary_election_data("congress", year = 1989, by_parties = TRUE, level = "ccaa", short_version = FALSE)
+e1986ccaa <- summary_election_data("congress", year = 1986, by_parties = TRUE, level = "ccaa", short_version = FALSE)
+e1982ccaa <- summary_election_data("congress", year = 1982, by_parties = TRUE, level = "ccaa", short_version = FALSE)
+```
+
+```{r}
+e2019Nccaa <- summary_election_data("congress", date = "2019-11-10", by_parties = TRUE, level = "ccaa", short_version = FALSE)
+e2019Accaa <- summary_election_data("congress", date = "2019-04-28", by_parties = TRUE, level = "ccaa", short_version = FALSE)
+```
+
+In order to allocate the correct number of seats per region, we first map provinces to their corresponding ccaa and then sum provincial seat totals by region and election:
+
+```{r}
+prov_to_ccaa <- tibble(
+  prov = c(
+    "Almería", "Cádiz", "Córdoba", "Granada", "Huelva", "Jaén", "Málaga", "Sevilla",
+    "Huesca", "Teruel", "Zaragoza",
+    "Asturias",
+    "Islas Baleares/Illes Balears",
+    "Las Palmas", "Santa Cruz de Tenerife",
+    "Cantabria",
+    "Ávila", "Burgos", "León", "Palencia", "Salamanca", "Segovia", "Soria", "Valladolid", "Zamora",
+    "Albacete", "Ciudad Real", "Cuenca", "Guadalajara", "Toledo",
+    "Barcelona", "Girona","Lleida", "Tarragona",
+    "Alicante/Alacant", "Castellón/Castelló", "Valencia/València",
+    "Badajoz", "Cáceres",
+    "La Coruña/A Coruña", "Lugo", "Orense/Ourense", "Pontevedra",
+    "Madrid",
+    "Murcia",
+    "Navarra/Nafarroa",
+    "Álava/Araba", "Guipúzcoa/Gipuzkoa", "Vizcaya/Bizkaia",
+    "La Rioja", 
+    "Ceuta", "Melilla"
+  ),
+  ccaa = c(
+    rep("Andalucía", 8),
+    rep("Aragón", 3),
+    "Principado de Asturias",
+    "Islas Baleares (Illes Balears)",
+    rep("Canarias", 2),
+    "Cantabria",
+    rep("Castilla y León", 9),
+    rep("Castilla-La Mancha", 5),
+    rep("Cataluña (Catalunya)", 4),
+    rep("Comunidad Valenciana (Comunitat Valenciana)", 3),
+    rep("Extremadura", 2),
+    rep("Galicia (Galiza)", 4),
+    "Comunidad de Madrid",
+    "Región de Murcia",
+    "Comunidad Foral de Navarra",
+    rep("País Vasco (Euskadi)", 3),
+    "La Rioja",
+    "Ceuta", "Melilla"
+  )
+)
+
+total_seats_ccaa <- total_seats %>%
+  left_join(prov_to_ccaa, by = "prov") %>%
+  group_by(ccaa, election) %>%
+  summarise(seats = sum(seats), .groups = "drop")
+```
+
+With these totals in place, we can now define a function, allocate_seats_by_ccaa(), which applies the same logic as allocate_seats_by_prov() but operates at the regional level. Specifically, it uses total_seats_ccaa to determine the number of seats available in each Comunidad Autónoma for every election. This ensures that the apportionment methods are applied consistently while respecting the actual institutional distribution of seats.
+
+```{r}
+allocate_seats_by_ccaa <- function(data, total_seats_ccaa, method = "dhondt", threshold = 0.03, short_version = TRUE) {
+  
+  if (!"election" %in% names(data)) {
+    data <- data |> 
+      mutate(election = str_extract(id_elec, "\\d{4}"))
+  }
+  
+  total_seats_ccaa <- total_seats_ccaa |>
+    mutate(
+      election = as.character(election),
+      ccaa = str_trim(ccaa)
+    )
+  
+  data <- data |>
+    mutate(
+      election = as.character(election),
+      ccaa = str_trim(ccaa)
+    )
+  
+  results <- data |>
+    group_split(election, ccaa) |>
+    map_dfr(function(df) {
+      elec <- str_trim(unique(df$election))
+      region <- str_trim(unique(df$ccaa))
+      
+      nseats <- total_seats_ccaa |>
+        filter(ccaa == region, election == elec) |>
+        pull(seats)
+      
+      if (length(nseats) == 0 || is.na(nseats)) {
+        message(glue("⚠️ No seats info for region: {region}, election: {elec}"))
+        return(NULL)
+      }
+      
+      result <- allocate_seats(
+        data = df,
+        method = method,
+        threshold = threshold,
+        nseats = nseats,
+        short_version = short_version
+      ) |>
+        mutate(ccaa = region)
+      
+      return(result)
+    })
+  
+  return(results)
+}
+```
+
+Once defined, we use this function to allocate seats across all elections in our dataset. The results are then aggregated by candidacy ID and linked back to party abbreviations to make the outputs interpretable:
+
+```{r}
+datasets_ccaa <- list(
+  e2023 = e2023ccaa,
+  e2019N = e2019Nccaa,
+  e2019A = e2019Accaa,
+  e2016 = e2016ccaa,
+  e2015 = e2015ccaa,
+  e2011 = e2011ccaa,
+  e2008 = e2008ccaa,
+  e2004 = e2004ccaa,
+  e2000 = e2000ccaa,
+  e1996 = e1996ccaa,
+  e1993 = e1993ccaa,
+  e1989 = e1989ccaa,
+  e1986 = e1986ccaa,
+  e1982 = e1982ccaa
+)
+
+
+results_ccaa <- imap(datasets_ccaa, function(df, name) {
+  
+  formula <- allocate_seats_by_ccaa(
+    data = df,
+    total_seats_ccaa = total_seats_ccaa,
+    method = "dhondt",       
+    threshold = 0.03,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+
+results_ccaa$e2023
+```
+
+```{r}
+disprop_index_ccaa <- map(results_ccaa, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+
+disprop_index_ccaa
+```
+
+
+### Regional Level aggregation with different thresholds
+
+After establishing the baseline with the standard 3% electoral threshold, we also simulate the alternative thresholds (0%, 1%, 2%, 4%, 5%, 7%, and 10%).
+
+```{r}
+results_ccaa_0 <- imap(
+  datasets_ccaa, function(df, name) {
+  
+  formula <- allocate_seats_by_ccaa(
+    data = df,
+    total_seats_ccaa = total_seats_ccaa,
+    method = "dhondt",       
+    threshold = 0,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+results_ccaa_0.01 <- imap(datasets_ccaa, function(df, name) {
+  
+  formula <- allocate_seats_by_ccaa(
+    data = df,
+    total_seats_ccaa = total_seats_ccaa,
+    method = "dhondt",       
+    threshold = 0.01,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+results_ccaa_0.02 <- imap(datasets_ccaa, function(df, name) {
+  
+  formula <- allocate_seats_by_ccaa(
+    data = df,
+    total_seats_ccaa = total_seats_ccaa,
+    method = "dhondt",       
+    threshold = 0.02,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+results_ccaa_0.04 <- imap(datasets_ccaa, function(df, name) {
+  
+  formula <- allocate_seats_by_ccaa(
+    data = df,
+    total_seats_ccaa = total_seats_ccaa,
+    method = "dhondt",       
+    threshold = 0.04,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+results_ccaa_0.05 <- imap(datasets_ccaa, function(df, name) {
+  
+  formula <- allocate_seats_by_ccaa(
+    data = df,
+    total_seats_ccaa = total_seats_ccaa,
+    method = "dhondt",       
+    threshold = 0.05,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+results_ccaa_0.07 <- imap(datasets_ccaa, function(df, name) {
+  
+  formula <- allocate_seats_by_ccaa(
+    data = df,
+    total_seats_ccaa = total_seats_ccaa,
+    method = "dhondt",       
+    threshold = 0.07,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+results_ccaa_0.1 <- imap(datasets_ccaa, function(df, name) {
+  
+  formula <- allocate_seats_by_ccaa(
+    data = df,
+    total_seats_ccaa = total_seats_ccaa,
+    method = "dhondt",       
+    threshold = 0.1,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+```
+
+Finally, we compute the disproportionality indices for each threshold scenario, enabling us to directly compare how proportionality changes as thresholds rise:
+
+```{r}
+
+disprop_index_ccaa_0 <- map(results_ccaa_0, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+disprop_index_ccaa_0.01 <- map(results_ccaa_0.01, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+disprop_index_ccaa_0.02 <- map(results_ccaa_0.02, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+disprop_index_ccaa_0.04 <- map(results_ccaa_0.04, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+disprop_index_ccaa_0.05 <- map(results_ccaa_0.05, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+disprop_index_ccaa_0.07 <- map(results_ccaa_0.07, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+disprop_index_ccaa_0.1 <- map(results_ccaa_0.1, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+```
+
+
+# Electoral outcomes under alternative Apportionment methods
+
+In this section, we examine how electoral outcomes would change if Spain adopted alternative apportionment formulas. The underlying rules of the system remain the same as in the baseline scenario: provincial constituencies and a 3% electoral threshold. 
+
+Since the different formulas have already been defined earlier, here we simply apply them through the allocate_seats_by_prov() function. This allows us to compare results across elections under D’Hondt, Webster, Adams, Dean, Hill–Huntington, Hagenbach–Bischoff, Hamilton, and First-Past-the-Post.
+
+```{r}
+#Hamilton
+results_prov_hamilton <- imap(datasets_prov, function(df, name) {
+  
+  formula <- allocate_seats_by_prov(
+    data = df,
+    total_seats = total_seats,
+    method = "hamilton",       
+    threshold = 0.03,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies_nat) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+results_prov_hamilton$e2023
+```
+
+
+```{r}
+# Hagebach Bischoff
+results_prov_hagenbach <- imap(datasets_prov, function(df, name) {
+  
+  formula <- allocate_seats_by_prov(
+    data = df,
+    total_seats = total_seats,
+    method = "hagenbach",       
+    threshold = 0.03,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies_nat) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+results_prov_hagenbach$e2023
+```
+
+
+```{r}
+# Webster
+results_prov_webster <- imap(datasets_prov, function(df, name) {
+  
+  formula <- allocate_seats_by_prov(
+    data = df,
+    total_seats = total_seats,
+    method = "webster",       
+    threshold = 0.03,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies_nat) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+results_prov_webster$e2023
+```
+
+```{r}
+# Hill
+results_prov_hill <- imap(datasets_prov, function(df, name) {
+  
+  formula <- allocate_seats_by_prov(
+    data = df,
+    total_seats = total_seats,
+    method = "hill",       
+    threshold = 0.03,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies_nat) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+results_prov_hill$e2023
+```
+
+```{r}
+# Deans
+results_prov_deans <- imap(datasets_prov, function(df, name) {
+  
+  formula <- allocate_seats_by_prov(
+    data = df,
+    total_seats = total_seats,
+    method = "deans",       
+    threshold = 0.03,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies_nat) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+results_prov_deans$e2023
+```
+
+```{r}
+# Adams
+results_prov_adams <- imap(datasets_prov, function(df, name) {
+  
+  formula <- allocate_seats_by_prov(
+    data = df,
+    total_seats = total_seats,
+    method = "adams",       
+    threshold = 0.03,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies_nat) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+results_prov_adams$e2023
+```
+
+
+```{r}
+#First Past the Post
+
+results_prov_fptp <- imap(datasets_prov, function(df, name) {
+  
+  formula <- allocate_seats_by_prov(
+    data = df,
+    total_seats = total_seats,
+    method = "fptp",       
+    threshold = 0.03,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies_nat) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+results_prov_fptp$e2023
+```
+
+Finally, we compute the disproportionality indices for each case in order to assess how sensitive proportionality is to changes in the allocation rule.
+
+```{r}
+# Apportionment method: Hamilton
+
+disprop_index_hamilton <- map(results_prov_hamilton, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+
+disprop_index_hamilton
+```
+
+```{r}
+# Apportionment method: Hagebach Bischoff
+
+disprop_index_hagenbach <- map(results_prov_hagenbach, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+
+disprop_index_hagenbach
+```
+
+```{r}
+# Apportionment method: Hill
+
+disprop_index_hill <- map(results_prov_hill, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+
+disprop_index_hill
+```
+
+```{r}
+# Apportionment method: Webster
+
+disprop_index_webster <- map(results_prov_webster, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+
+disprop_index_webster
+```
+
+```{r}
+# Apportionment method: Deans
+
+disprop_index_deans <- map(results_prov_deans, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+
+disprop_index_deans
+```
+
+```{r}
+# Apportionment method: Adams
+
+disprop_index_adams <- map(results_prov_adams, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+
+disprop_index_adams
+```
+
+```{r}
+# Apportionment method: First Past the Post
+
+disprop_index_fptp <- map(results_prov_fptp, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+
+disprop_index_fptp
+```
+
+## Alternative Apportionment methods with alternative thresholds
+
+To push the analysis beyond single-rule changes, we now test the apportionment methods that performed best on disproportionality indices under different constituency designs. Holding the legal threshold at 3% and reusing the same data pipelines, we apply these methods to two alternative territorial configurations: regional constituencies (CCAA) and a single national constituency.
+
+This setup lets us isolate how the interaction between a given allocation formula (e.g., Hamilton, Webster/Sainte-Laguë, Hagenbach–Bischoff, Adams) and the level of aggregation (CCAA vs. national) affects proportionality and party representation—while keeping other institutional features constant. After allocating seats in each scenario, we recompute the disproportionality indices to compare outcomes directly across methods and constituencies.
+
+
+```{r}
+results_ccaa_hamilton <- imap(datasets_ccaa, function(df, name) {
+  
+  formula <- allocate_seats_by_ccaa(
+    data = df,
+    total_seats_ccaa = total_seats_ccaa,
+    method = "hamilton",       
+    threshold = 0.03,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+disprop_index_ccaa_hamilton <- map(results_ccaa_hamilton, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+```
+
+
+```{r}
+results_ccaa_webster <- imap(datasets_ccaa, function(df, name) {
+  
+  formula <- allocate_seats_by_ccaa(
+    data = df,
+    total_seats_ccaa = total_seats_ccaa,
+    method = "webster",       
+    threshold = 0.03,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+disprop_index_ccaa_webster <- map(results_ccaa_webster, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+```
+
+```{r}
+results_ccaa_hagenbach <- imap(datasets_ccaa, function(df, name) {
+  
+  formula <- allocate_seats_by_ccaa(
+    data = df,
+    total_seats_ccaa = total_seats_ccaa,
+    method = "hagenbach",       
+    threshold = 0.03,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+disprop_index_ccaa_hagenbach <- map(results_ccaa_hagenbach, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+```
+
+```{r}
+results_ccaa_adams <- imap(datasets_ccaa, function(df, name) {
+  
+  formula <- allocate_seats_by_ccaa(
+    data = df,
+    total_seats_ccaa = total_seats_ccaa,
+    method = "adams",       
+    threshold = 0.03,
+    short_version = TRUE
+  )
+  
+    res <- formula |>
+    group_by(id_candidacies) |>
+    summarise(
+      abbrev_candidacies = first(abbrev_candidacies),
+      total_ballots = sum(total_ballots, na.rm = TRUE),
+      total_seats   = sum(total_seats, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_ballots))
+  
+  return(res)
+})
+
+disprop_index_ccaa_adams <- map(results_ccaa_adams, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+```
+
+
+```{r}
+results_nat_hamilton <- map(datasets_nat, function(df) {
+  allocate_seats(df, method = "hamilton", threshold = 0.03, nseats = 350)
+})
+
+disprop_index_nat_hamilton <- map(results_nat_hamilton, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+```
+
+```{r}
+results_nat_webster <- map(datasets_nat, function(df) {
+  allocate_seats(df, method = "webster", threshold = 0.03, nseats = 350)
+})
+
+disprop_index_nat_webster <- map(results_nat_webster, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+```
+
+```{r}
+results_nat_hagenbach <- map(datasets_nat, function(df) {
+  allocate_seats(df, method = "hagenbach", threshold = 0.03, nseats = 350)
+})
+
+disprop_index_nat_hagenbach <- map(results_nat_hagenbach, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+```
+
+```{r}
+results_nat_adams <- map(datasets_nat, function(df) {
+  allocate_seats(df, method = "adams", threshold = 0.03, nseats = 350)
+})
+
+disprop_index_nat_adams <- map(results_nat_adams, function(df) {
+  calculate_disproportionality_indices(votes = df$total_ballots, seats = df$total_seats)
+})
+```
+
+# Summary Tables
+
+To systematically compare the different electoral simulations, we compile the disproportionality indices from all simulations into a unified long-format table. Each simulation, whether based on a different apportionment method, legal threshold, or constituency structure, is stored as an element in the all_simulations list.
+
+We then define a function, process_simulation(), which extracts the relevant data from each simulation. For each election within a simulation, it cleans the election identifier to keep only the year, and records the values of all disproportionality indices. The function returns a tidy tibble with four columns:
+
+- election: the cleaned year of the election,
+- simulation: the simulation label (e.g., "deans", "adams", "threshold_0.07", etc.),
+- index: the name of the disproportionality index,
+- value: the numerical value of the index for that simulation and election.
+
+Using map2_dfr(), we apply this function across all simulations to create all_results_long, a comprehensive table combining all index values across simulations and years.
+
+```{r}
+all_simulations <- list(
+  actual_system = disprop_index_list,
+  deans = disprop_index_deans,
+  hamilton = disprop_index_hamilton,
+  adams = disprop_index_adams,
+  fptp = disprop_index_fptp,
+  hagenbach = disprop_index_hagenbach,
+  hill = disprop_index_hill,
+  webster = disprop_index_webster,
+  threshold_0 = disprop_index_0,
+  threshold_0.01 = disprop_index_0.01,
+  threshold_0.02 = disprop_index_0.02,
+  threshold_0.04 = disprop_index_0.04,
+  threshold_0.05 = disprop_index_0.05,
+  threshold_0.07 = disprop_index_0.07,
+  threshold_0.1 = disprop_index_0.1,
+  national_constituency = disprop_index_nat,
+  ccaa_constituency = disprop_index_ccaa,
+  ccaa_threshold_0 = disprop_index_ccaa_0,
+  ccaa_threshold_0.01 = disprop_index_ccaa_0.01,
+  ccaa_threshold_0.02 = disprop_index_ccaa_0.02,
+  ccaa_threshold_0.04 = disprop_index_ccaa_0.04,
+  ccaa_threshold_0.05 = disprop_index_ccaa_0.05,
+  ccaa_threshold_0.07 = disprop_index_ccaa_0.07,
+  ccaa_threshold_0.1 = disprop_index_ccaa_0.1,
+  nat_threshold_0 = disprop_index_nat_0,
+  nat_threshold_0.01 = disprop_index_nat_0.01,
+  nat_threshold_0.02 = disprop_index_nat_0.02,
+  nat_threshold_0.04 = disprop_index_nat_0.04,
+  nat_threshold_0.05 = disprop_index_nat_0.05,
+  nat_threshold_0.07 = disprop_index_nat_0.07,
+  nat_threshold_0.1 = disprop_index_nat_0.1,
+  ccaa_webster = disprop_index_ccaa_webster,
+  ccaa_hamilton = disprop_index_ccaa_hamilton,
+  ccaa_hagenbach = disprop_index_ccaa_hagenbach,
+  ccaa_adams = disprop_index_ccaa_adams,
+  nat_webster = disprop_index_nat_webster,
+  nat_hamilton = disprop_index_nat_hamilton,
+  nat_hagenbach = disprop_index_nat_hagenbach,
+  nat_adams = disprop_index_nat_adams
+)
+
+
+process_simulation <- function(sim_name, sim_list) {
+  map_dfr(names(sim_list), function(elec) {
+
+    election_clean <- gsub("e", "", elec)
+    
+    indices <- sim_list[[elec]]
+    tibble(
+      election = election_clean,
+      simulation = sim_name,
+      index = names(indices),
+      value = unlist(indices)
+    )
+  }) %>%
+    arrange(desc(election))
+}
+
+all_results_long <- map2_dfr(names(all_simulations), all_simulations, process_simulation)
+
+all_results_long
+```
+
+Finally, to summarize and compare overall trends, we calculate the mean value of each disproportionality index per simulation aggregating across all elections. This produces the summary_table, which contains one row per combination of simulation and index, allowing for direct comparison of average disproportionality levels across all tested scenarios.
+
+```{r}
+summary_table <- all_results_long %>%
+  group_by(simulation, index) %>%
+  summarise(mean_value = mean(value), .groups = "drop")
+
+summary_table
+```
+
+Now we perform the same consolidation for seat outcomes, creating a single long-format table of party seats (and ballots) across all simulations and elections.
+
+```{r}
+simulations <- list(
+  actual_system = results_prov,
+  adams = results_prov_adams,
+  hill = results_prov_hill,
+  deans = results_prov_deans,
+  fptp = results_prov_fptp,
+  hagenbach = results_prov_hagenbach,
+  hamilton = results_prov_hamilton,
+  webster = results_prov_webster,
+  threshold_0 = results_prov_0,
+  threshold_0.01 = results_prov_0.01,
+  threshold_0.02 = results_prov_0.02,
+  threshold_0.04 = results_prov_0.04,
+  threshold_0.05 = results_prov_0.05,
+  threshold_0.07 = results_prov_0.07,
+  threshold_0.1 = results_prov_0.1,
+  national_constituency = results_nat,
+  ccaa_constituency =  results_ccaa,
+  ccaa_threshold_0 = results_ccaa_0,
+  ccaa_threshold_0.01 = results_ccaa_0.01,
+  ccaa_threshold_0.02 = results_ccaa_0.02,
+  ccaa_threshold_0.04 = results_ccaa_0.04,
+  ccaa_threshold_0.05 = results_ccaa_0.05,
+  ccaa_threshold_0.07 = results_ccaa_0.07,
+  ccaa_threshold_0.1 = results_ccaa_0.1,
+  nat_threshold_0 = results_nat_0,
+  nat_threshold_0.01 = results_nat_0.01,
+  nat_threshold_0.02 = results_nat_0.02,
+  nat_threshold_0.04 = results_nat_0.04,
+  nat_threshold_0.05 = results_nat_0.05,
+  nat_threshold_0.07 = results_nat_0.07,
+  nat_threshold_0.1 = results_nat_0.1,
+  ccaa_webster = results_ccaa_webster,
+  ccaa_hamilton = results_ccaa_hamilton,
+  ccaa_hagenbach = results_ccaa_hagenbach,
+  ccaa_adams = results_ccaa_adams,
+  nat_webster = results_nat_webster,
+  nat_hamilton = results_nat_hamilton,
+  nat_hagenbach = results_nat_hagenbach,
+  nat_adams = results_nat_adams
+)
+
+long_from_list <- function(lst, method_name) {
+  map2_df(lst, names(lst), ~ {
+    df <- .x
+    df %>%
+      select(party = abbrev_candidacies, seats = total_seats, ballots = total_ballots) %>%
+      mutate(
+        election = str_remove(.y, "^e"),  
+        simulation = method_name
+      )
+  })
+}
+
+
+seats_data <- map2_df(simulations, names(simulations), ~ long_from_list(.x, .y))
+```
+
+```{r}
+save.image(file = "good_environment.RData")
+ 
+load("/Users/jordi/Desktop/paquetee/vignettes/good_environment.RData")
+```
+
+# Data Visualization
+
+Dividiremos los apartadosd de codigo del data visualizatino por los apartados del analisis de resultado
+
+explicar que antes de empezar con los graficos definimos primero la fuente que utilizaremos(times new roman como el resto del trabajo), los colores de los partiods asi coo una paleta estandar par los idnices y otras cosas
+
+```{r}
+palette16 <- c(brewer.pal(8, "Set2"), brewer.pal(8, "Set3"))
+
+
+font_add("Times New Roman", regular = "/Library/Fonts/Times New Roman.ttf")
+showtext_auto()
+
+party_colors <- c("PP" = "#1db4e8",
+      "PSOE" = "#c30505",
+      "SUMAR" = "#e71853",
+      "PODEMOS" = "#a444b4",
+      "VOX" = "#83b431",
+      "ERC" = "#ffbf41",
+      "ERC-CATSI" = "#ffbf41",
+      "CIU" = "#1b348a",
+      "CDC" = "#1b348a",
+      "DIL" = "#1b348a",
+      "MP" = "#004938",
+      "CS" = "#eb6109",
+      "PNV" = "darkgreen",
+      "BNG" = "lightblue",
+      "EH-BILDU" = "darkolivegreen2",
+      "JXCAT-JUNTS" = "#03cfb4",
+      "CC" = "#2f6da6",
+      "UPN" = "#e72c2e",
+      "NC-BC" = "#81c03b",
+      "UPL" = "#b71966",
+      "EXISTE" = "#227e57",
+      "CUP" = "#fff201",
+      "ECP" = "#a444b4", 
+      "ENMAREA" = "#a444b4",
+      "COMPROMIS" = "#d95827",
+      "IU" = "#a9272f", 
+      "UPYD" = "#e5007d",
+      "AMAIUR" = "#0198b3",
+      "ERPV" = "#ffbf41",
+      "PSA-PA" = "#19a24a",
+      "CDS" = "#b2c544",
+      "AP-PDP-PL" = "#ffa518",
+      "UCD" = "#1a7e36",
+      "PCE" = "#961425",
+      "HB" = "#613000"
+    )
+```
+
+## Proportionality of the current spanish electoral system
+
+Boxplot of distribution of disproportionality indices
+
+```{r}
+all_results_long <- all_results_long %>%
+  mutate(election = factor(election, 
+                           levels = c("1982", "1986", "1989", "1993", "1996", "2000",                                      "2004", "2008", "2011", "2015", "2016", "2019A", "2019N",                                       "2023"),
+                           ordered = TRUE))
+
+actual_data  <- all_results_long %>% 
+  filter(simulation == "actual_system") %>%
+  mutate(index = factor(
+    index,
+    levels = c("Gallagher", "Loosemore-Hanby", "Sainte-Laguë", "Rae's", "Lijphart", "D'Hondt")
+  ))
+
+
+ggplot(actual_data, aes(x = index, y = value, fill = index)) +
+  geom_violin(alpha = 0.4, color = NA) +
+  geom_boxplot(width = 0.15, outlier.size = 1, alpha = 0.7) +
+  scale_fill_manual(values = palette16, guide = "none") +
+  # <<< Eje Y controlado y sin “salto” a 15
+  scale_y_continuous(
+    limits = c(0, 14),                
+    breaks = seq(0, 14, by = 2),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(
+    title = "Distribution of disproportionality indices",
+    subtitle = "Current electoral system (all elections, 1977–2023)",
+    x = NULL,
+    y = "Index value"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    text = element_text(family = "Times New Roman"),
+    axis.text.x   = element_text(angle = 20, hjust = 1, size = 10),
+    axis.text.y   = element_text(size = 10),
+    axis.title.x  = element_text(size = 9, margin = margin(t = 10)),
+    axis.title.y  = element_text(size = 9, margin = margin(r = 8)),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    plot.title    = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 13, color = "grey35", margin = margin(b = 15)),
+    plot.margin   = margin(t = 8, r = 12, b = 12, l = 12)
+  )
+```
+
+Evolution of disproportionality indices
+
+```{r}
+means <- actual_data %>%
+  group_by(index) %>%
+  summarise(mean_val = mean(value, na.rm = TRUE))
+
+
+facet_labels <- setNames(
+  paste0(levels(factor(actual_data$index)), 
+         "\nMean = ", round(means$mean_val, 2)),
+  levels(factor(actual_data$index))
+)
+
+ggplot(actual_data, aes(x = election, y = value, color = index, group = index)) +
+  geom_line(linewidth = 0.6) +
+  geom_point(shape = 16, size = 1.9) +
+  scale_color_manual(
+    values = palette16,
+    breaks = levels(actual_data$index),
+    name   = "Indices"
+  ) +
+  facet_wrap(
+    ~ index, 
+    scales = "free_y",
+    labeller = labeller(index = facet_labels)   
+  ) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10)) +
+  labs(
+    title    = "Evolution of disproportionality indices",
+    subtitle = "Current electoral system",
+    x = "Election",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    text = element_text(family = "Times New Roman"),
+    axis.text.x   = element_text(angle = 40, hjust = 1, size = 10),
+    axis.text.y   = element_text(size = 10),
+    axis.title.x  = element_text(size = 9, margin = margin(t = 10)),
+    axis.title.y  = element_text(size = 9, margin = margin(r = 8)),
+    panel.grid.minor = element_blank(),
+    plot.title    = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 13, color = "grey35", margin = margin(b = 15)),
+    legend.position   = "none",
+    plot.margin = margin(t = 8, r = 12, b = 12, l = 12)
+  )
+```
+
+### Winners and losers under the current system
+
+Average bias by party (current system)
+
+```{r}
+df_bias_party <- seats_data %>%
+  filter(simulation == "actual_system") %>%
+  group_by(election) %>%
+  mutate(
+    vshare = ballots / sum(ballots, na.rm = TRUE),  
+    sshare = seats   / sum(seats, na.rm = TRUE),    
+    bias   = sshare - vshare                       
+  ) %>%
+  ungroup() %>%
+  group_by(party) %>%
+  summarise(mean_bias = mean(bias, na.rm = TRUE) * 100, .groups = "drop") %>%
+  arrange(mean_bias)
+
+
+average_bias_party <- bind_rows(
+  df_bias_party %>% arrange(desc(mean_bias)) %>% slice_head(n = 10),
+  df_bias_party %>% arrange(mean_bias)       %>% slice_head(n = 10)
+) %>%
+  mutate(sign = if_else(mean_bias >= 0, "Seats > Votes", "Seats < Votes"),
+         party = fct_reorder(party, mean_bias))
+
+ggplot(average_bias_party, aes(x = mean_bias, y = party, fill = sign, label = round(mean_bias, 2))) +
+  geom_col(width = 0.7, color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey45") +
+  geom_text(hjust = if_else(average_bias_party$mean_bias >= 0, -0.1, 1.1), size = 3) +
+  scale_fill_manual(values = c("Seats > Votes" = "#1b7837", "Seats < Votes" = "#b2182b")) +
+  scale_x_continuous(expand = expansion(mult = c(.08, .08))) +
+  labs(
+    title = "Average bias by party",
+    subtitle = "Bias = % seats − % votes (1982–2023)",
+    x = "Average bias (percentage points)", y = NULL, fill = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    text = element_text(family = "Times New Roman"),
+    axis.text.y = element_text(size = 9),
+    axis.text.x = element_text(size = 9),
+    axis.title.x = element_text(size = 9),
+    legend.position = "none",
+    legend.box = "horizontal",
+    legend.background = element_rect(fill = "white", color = "black", linewidth = .4),
+    plot.title = element_text(face = "bold", size = 16, margin = margin(b = 4)),
+    plot.subtitle = element_text(size = 13, color = "grey35", margin = margin(b = 10))
+  )
+```
+
+### Disproportionality by constituency
+
+Average disproportionality by province
+
+```{r}
+# First we calculate the indices by province
+
+seats_by_prov <- imap(datasets_prov, function(df, nm) {
+  allocate_seats_by_prov(
+    data = df,
+    total_seats_prov = total_seats,
+    method = "dhondt",
+    threshold = 0.03,
+    short_version = TRUE
+  )
+})
+
+seats_by_prov_df <- bind_rows(seats_by_prov, .id = "election")
+
+index_by_prov <- seats_by_prov_df %>%
+  group_by(election, prov) %>%
+  summarise(
+    idx = list(calculate_disproportionality_indices(
+      votes = total_ballots,
+      seats = total_seats
+    )),
+    .groups = "drop"
+  ) %>%
+  unnest_wider(idx)
+
+
+mean_index_by_prov <- index_by_prov %>%
+  group_by(prov) %>%
+  summarise(
+    mean_gallagher       = mean(gallagher, na.rm = TRUE),
+    mean_loosemore_hanby = mean(loosemore_hanby, na.rm = TRUE),
+    mean_saint_lague     = mean(saint_lague, na.rm = TRUE),
+    mean_rae             = mean(rae, na.rm = TRUE),
+    mean_lijphart        = mean(lijphart, na.rm = TRUE),
+    mean_dhondt          = mean(dhondt, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#Then, we plot the map
+
+provinces <- rnaturalearth::ne_states(country = "Spain", returnclass = "sf")
+
+provinces <- provinces %>%
+  mutate(prov = case_when(
+    name == "Gerona"                  ~ "Girona",
+    name == "Lérida"                  ~ "Lleida",
+    name == "La Coruña"               ~ "La Coruña/A Coruña",
+    name == "Orense"                  ~ "Orense/Ourense",
+    name == "Baleares"                ~ "Islas Baleares/Illes Balears",
+    name == "Gipuzkoa"                ~ "Guipúzcoa/Gipuzkoa",
+    name == "Bizkaia"                 ~ "Vizcaya/Bizkaia",
+    name == "Álava"                   ~ "Álava/Araba",
+    name == "Navarra"                 ~ "Navarra/Nafarroa",
+    name == "Alicante"                ~ "Alicante/Alacant",
+    name == "Castellón"               ~ "Castellón/Castelló",
+    name == "Valencia"                ~ "Valencia/València",
+    TRUE ~ name
+  ))
+
+map_data <- provinces %>%
+  left_join(mean_index_by_prov, by = "prov") %>%
+  filter(!prov %in% c("Ceuta", "Melilla"))
+
+
+canarias <- map_data %>% filter(name %in% c("Las Palmas", "Santa Cruz de Tenerife"))
+peninsula <- map_data %>% filter(!name %in% c("Las Palmas", "Santa Cruz de Tenerife"))
+common_limits <- range(c(peninsula$mean_gallagher, canarias$mean_gallagher), na.rm = TRUE)
+
+map_peninsula <- ggplot(peninsula) +
+  geom_sf(aes(fill = mean_gallagher), color = "white", size = 0.2) +
+  coord_sf(xlim = c(-10, 5), ylim = c(35, 44), expand = FALSE) +
+  scale_fill_gradient(low = "#d0e6a5", high = "#d73027",
+                      limits = common_limits,   # <- fija rango global
+                      name = "Gallagher\n(avg.)",
+                      labels = scales::number_format(accuracy = 0.1)) +
+  labs(
+    title = "Average disproportionality by province",
+    subtitle = "Gallagher index (all elections, 1982–2023)",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 12, ) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 16, margin = margin(b = 4)),
+    plot.subtitle = element_text(size = 13, color = "grey35", margin = margin(b = 30)),
+    legend.position = "right",
+    legend.title = element_text(size = 10, face = "bold"),
+    legend.text  = element_text(size = 8),
+    legend.key.height = unit(0.7, "cm"),
+    legend.key.width  = unit(0.25, "cm"),
+    plot.margin = margin(8, 8, 8, 8)
+  )
+
+map_canarias <- ggplot(canarias) +
+  geom_sf(aes(fill = mean_gallagher), color = "white", size = 0.2) +
+  coord_sf(xlim = c(-19, -12), ylim = c(27, 30), expand = FALSE) +
+  scale_fill_gradient(low = "#d0e6a5", high = "#d73027",
+                      limits = common_limits,   # <- fija rango global
+                      name = "Gallagher\n(avg.)",
+                      labels = scales::number_format(accuracy = 0.1)) +
+  theme_void() +
+  theme(legend.position = "none")
+
+ggdraw() +
+  draw_plot(map_peninsula) +
+  draw_plot(map_canarias, x = 0.72, y = 0.05, width = 0.2, height = 0.2) +
+  geom_rect(aes(xmin = 0.72, xmax = 0.92, ymin = 0.05, ymax = 0.25),
+            color = "black", fill = NA, linewidth = 0.2)
+
+```
+
+District magnitude vs Gallagher
+
+```{r}
+
+gallagher_by_prov <- seats_by_prov_df %>%
+  group_by(election, prov) %>%
+  summarise(
+    gallagher = {
+      idx <- calculate_disproportionality_indices(total_ballots, total_seats)
+      idx$gallagher
+    },
+    M = sum(total_seats),        
+    .groups = "drop"
+  ) %>%
+  mutate(
+    size_cat = dplyr::case_when(
+      M <= 3   ~ "Very small (1–3)",
+      M <= 5   ~ "Small (4–5)",
+      M <= 8   ~ "Medium (6–8)",
+      M <= 15  ~ "Large (9–15)",
+      TRUE     ~ "Very large (16+)"
+    ),
+    size_cat = factor(size_cat, levels = c(
+      "Very small (1–3)", "Small (4–5)", "Medium (6–8)", "Large (9–15)", "Very large (16+)"
+    ))
+  )
+
+ggplot(gallagher_by_prov, aes(x = M, y = gallagher, color = size_cat)) +
+  geom_point(size = 2.2, alpha = 0.55) +
+  geom_smooth(method = "loess", se = FALSE, linetype = "dashed", color = "gray40", span = 0.9) +
+  scale_color_manual(
+    values = c(
+      "Very small (1–3)" = "#7f3b08",
+      "Small (4–5)"      = "#b35806",
+      "Medium (6–8)"     = "#f1a340",
+      "Large (9–15)"     = "#998ec3",
+      "Very large (16+)" = "#542788"
+    ),
+    name = "District size"
+  ) +
+  labs(
+    title = "District magnitude vs Gallagher",
+    subtitle = "Each dot is a province in a specific election",
+    x = "District magnitude (seats)",
+    y = "Gallagher index"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    text = element_text(family = "Times New Roman"),
+    axis.text.x   = element_text(angle = 20, hjust = 1, size = 10),
+    axis.text.y   = element_text(size = 10),
+    axis.title.x  = element_text(size = 9, margin = margin(t = 10)),
+    axis.title.y  = element_text(size = 9, margin = margin(r = 8)),
+    panel.grid.minor = element_blank(),
+    plot.title    = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 13, color = "grey35", margin = margin(b = 15)),
+    legend.position   = "top",
+    legend.box        = "horizontal",
+    legend.background = element_rect(fill = "white", color = "black", linewidth = 0.2),
+    legend.key        = element_rect(fill = "white", color = NA),
+    legend.title      = element_text(size = 10, face = "bold"),
+    legend.text       = element_text(size = 9),
+    plot.margin = margin(t = 8, r = 12, b = 12, l = 12)
+  ) +
+  guides(color = guide_legend(nrow = 1))  
+
+```
+## Threshold Effect
+
+Disproportionality indices by threshold
+
+```{r}
+threshold_data <- all_results_long %>%
+  filter(simulation %in% c("threshold_0","threshold_0.01","threshold_0.02", "threshold_0.04","threshold_0.05","threshold_0.07", "threshold_0.1","actual_system"))
+
+
+ggplot(threshold_data, aes(x = simulation, y = value, group = index, color = index)) +
+    stat_summary(fun = mean, geom = "line", linewidth = 0.8) +
+    stat_summary(fun = mean, geom = "point", size = 2) +
+  scale_x_discrete(
+    limits = c("threshold_0","threshold_0.01","threshold_0.02",
+               "actual_system","threshold_0.04","threshold_0.05",
+               "threshold_0.07","threshold_0.1"),     
+    labels = c("0%","1%","2%","3% (current)","4%","5%","7%","10%")
+  ) +
+    facet_wrap(
+    ~ index, 
+    scales = "free_y"
+  ) +
+  scale_color_manual(
+    values = palette16,
+    labels = c(
+      "dhondt"          = "D'Hondt",
+      "gallagher"       = "Gallagher",
+      "lijphart"        = "Lijphart",
+      "loosemore_hanby" = "Loosemore–Hanby",
+      "rae"             = "Rae",
+      "saint_lague"     = "Sainte-Laguë"
+    ),
+    name = "Index"
+  )  +
+    labs(
+      title = "Disproportionality indices across thresholds",
+      subtitle = "Aggregated across elections (1982-2023)",
+      x = "Threshold",
+      y = "Disproportionality Index"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      text = element_text(family = "Times New Roman"),
+      axis.text.x   = element_text(angle = 40, hjust = 1, size = 10),
+      axis.text.y   = element_text(size = 10),
+      axis.title.x  = element_text(size = 9, margin = margin(t = 10)),
+      axis.title.y  = element_text(size = 9, margin = margin(r = 8)),
+      panel.grid.minor = element_blank(),
+      plot.title    = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(size = 11, color = "grey35", margin = margin(b = 15)),
+      legend.position   = "none",
+      plot.margin = margin(t = 8, r = 12, b = 12, l = 12)
+    ) 
+```
+Net seat changes by threshold
+
+```{r}
+seats_threshold <- seats_data %>%
+  filter(simulation %in% c("threshold_0","threshold_0.01","threshold_0.02", "threshold_0.04","threshold_0.05","threshold_0.07", "threshold_0.1","actual_system")) %>% 
+  mutate(
+    sim_lab = case_when(
+      simulation == "actual_system" ~ "3% (current)",
+      simulation == "threshold_0"    ~ "0%",
+      simulation == "threshold_0.01" ~ "1%",
+      simulation == "threshold_0.02" ~ "2%",
+      simulation == "threshold_0.04" ~ "4%",
+      simulation == "threshold_0.05" ~ "5%",
+      simulation == "threshold_0.07" ~ "7%",
+      simulation == "threshold_0.1"  ~ "10%",
+      TRUE ~ NA_character_
+    )
+  )
+
+
+seat_ref_threshold <- seats_threshold %>%
+  filter(sim_lab == "3% (current)") %>%                
+  select(election, party, seats_ref = seats)
+
+dt_party_delta_threshold <- seats_threshold %>%
+  left_join(seat_ref_threshold, by = c("election","party")) %>%
+  mutate(dseats = seats - coalesce(seats_ref, 0)) %>%     
+  filter(sim_lab != "3% (current)") %>%                 
+  group_by(party, sim_lab) %>%
+  summarise(dseats_total = sum(dseats, na.rm = TRUE), .groups = "drop")
+
+heat_df <- dt_party_delta_threshold %>%
+  group_by(party) %>%
+  mutate(abs_tot = sum(abs(dseats_total), na.rm = TRUE)) %>%
+  ungroup() %>%
+  filter(abs_tot > 3) %>%
+  mutate(
+    party  = forcats::fct_reorder(party, abs_tot),
+    sim_lab = factor(sim_lab, levels = c("0%","1%","2%","4%","5%","7%","10%"))
+  )
+
+ggplot(heat_df, aes(sim_lab, party, fill = dseats_total, label = round(dseats_total))) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(size = 3) +
+  scale_fill_gradient2(
+    low = "#b2182b", mid = "white", high = "#1b7837",
+    midpoint = 0, name = "Seats"
+  ) +
+  labs(
+    title    = "Net seat changes by threshold",
+    subtitle = "Relative to current threshold — aggregated across elections (1982-2023)",
+    x = "Threshold", y = NULL
+  ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      text = element_text(family = "Times New Roman"),
+      axis.text.x   = element_text(angle = 20, hjust = 1, size = 10),
+      axis.text.y   = element_text(size = 10),
+      axis.title.x  = element_text(size = 9, margin = margin(t = 10)),
+      axis.title.y  = element_text(size = 9, margin = margin(r = 8)),
+      panel.grid.minor = element_blank(),
+      plot.title    = element_text(face = "bold", size = 16),
+      plot.subtitle = element_text(size = 13, color = "grey35", margin = margin(b = 15)),
+      legend.key        = element_rect(fill = "white", color = NA),
+      legend.title      = element_text(size = 10, face = "bold"),
+      legend.text       = element_text(size = 9),
+      plot.margin = margin(t = 8, r = 12, b = 12, l = 12)
+    ) 
+```
+
+
+## The effect of constituency type
+
+Evolution of disproportionality indices by constituency level
+
+```{r}
+const_data <- all_results_long %>%
+  filter(simulation %in% c("actual_system", "ccaa_constituency", "national_constituency" ))
+
+ggplot(
+  const_data,
+  aes(
+    x = factor(election, levels = sort(unique(election))),
+    y = value,
+    group = simulation,
+    color = simulation
+  )
+) +
+  geom_line(linewidth = 0.5) +
+  geom_point(shape = 16, size = 1.8) +
+  scale_color_manual(
+    values = palette16,
+    breaks = c("actual_system","ccaa_constituency","national_constituency"),
+    labels = c("Provincial","CCAA","National"),
+    name   = "Constituency"
+  ) +
+  facet_wrap(
+    ~ index, 
+    scales = "free_y",
+    labeller = labeller(index = index_labels)
+  ) +
+labs(
+  title = "Evolution of disproportionality indices by constituency level",
+  subtitle = "Comparison of constituency scenarios across general elections (1982–2023)",
+  x = "Election",
+  y = "Disproportionality Index"
+) +
+  theme_minimal(base_size = 12) +
+  theme(
+    text = element_text(family = "Times New Roman"),
+    axis.text.x   = element_text(angle = 40, hjust = 1, size = 10),
+    axis.text.y   = element_text(size = 10),
+    axis.title.x  = element_text(size = 9, margin = margin(t = 10)),
+    axis.title.y  = element_text(size = 9, margin = margin(r = 8)),
+    panel.grid.minor = element_blank(),
+    plot.title    = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 13, color = "grey35", margin = margin(b = 15)),
+    legend.position   = "top",
+    legend.box        = "horizontal",
+    legend.background = element_rect(fill = "white", color = "black", linewidth = 0.2),
+    legend.key        = element_rect(fill = "white", color = NA),
+    legend.title      = element_text(size = 10, face = "bold"),
+    legend.text       = element_text(size = 9),
+    plot.margin = margin(t = 8, r = 12, b = 12, l = 12)
+  ) +
+  guides(color = guide_legend(nrow = 1))
+
+```
+
+```{r}
+seat_const <- seats_data %>%
+  filter(simulation %in% c("actual_system", "national_constituency", "ccaa_constituency"))%>%
+  mutate(
+    sim_lab = recode(simulation,
+                     "actual_system" = "Provincial",
+                     "national_constituency" = "National",
+                     "ccaa_constituency" = "CCAA"),
+    sim_lab = factor(sim_lab, levels = c("Provincial", "National", "CCAA"))
+  ) 
+
+baseline <- seat_const %>%
+  filter(sim_lab == "Provincial") %>%
+  select(election, party, seats_baseline = seats)
+
+deltas <- seat_const %>%
+  left_join(baseline, by = c("election","party")) %>%
+  mutate(dseats = seats - coalesce(seats_baseline, 0))
+
+heat_df <- deltas %>%
+  group_by(sim_lab, party) %>%
+  summarise(dseats_total = sum(dseats, na.rm = TRUE), .groups = "drop")
+
+
+plot_data <- heat_df %>%
+  filter(sim_lab != "Provincial") %>%  
+  filter(abs(dseats_total) >= 10) %>%
+  group_by(sim_lab) %>%
+  mutate(party = fct_reorder(party, abs(dseats_total), .desc = FALSE)) %>%
+  ungroup() %>% 
+  mutate(
+  party = fct_reorder(party, dseats_total, .desc = TRUE))
+
+ggplot(plot_data, aes(x = dseats_total, y = party, fill = dseats_total > 0)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey60") +
+  geom_col(width = 0.7, color = "white") +
+  facet_grid(. ~ sim_lab, scales = "free_x") +
+  scale_fill_manual(values = c("TRUE" = "#1b7837", "FALSE" = "#b2182b"), guide = "none") +
+  labs(
+    title = "Net seat changes by constituency",
+    subtitle = "Relative to Provincial — aggregated across elections (1982-2023)",
+    x = "Seats", y = NULL
+  ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      text = element_text(family = "Times New Roman"),
+      axis.text.x   = element_text(hjust = 1, size = 10),
+      axis.text.y   = element_text(size = 10),
+      axis.title.x  = element_text(size = 9, margin = margin(t = 10)),
+      axis.title.y  = element_text(size = 9, margin = margin(r = 8)),
+      panel.grid.minor = element_blank(),
+      plot.title    = element_text(face = "bold", size = 16),
+      plot.subtitle = element_text(size = 13, color = "grey35", margin = margin(b = 15)),
+      plot.margin = margin(t = 8, r = 20, b = 12, l = 0)
+    ) 
+```
+
+Gallagher index by threshold and constituency
+
+```{r}
+tabla_resumen <- all_results_long %>%
+  filter(
+    index == "gallagher",
+    simulation %in% c(
+      "actual_system",
+      "ccaa_constituency","national_constituency",
+      "threshold_0","threshold_0.01","threshold_0.02","threshold_0.04","threshold_0.05","threshold_0.07","threshold_0.1",
+      "ccaa_threshold_0","ccaa_threshold_0.01","ccaa_threshold_0.02","ccaa_threshold_0.04","ccaa_threshold_0.05","ccaa_threshold_0.07","ccaa_threshold_0.1",
+      "nat_threshold_0","nat_threshold_0.01","nat_threshold_0.02","nat_threshold_0.04","nat_threshold_0.05","nat_threshold_0.07","nat_threshold_0.1"
+    )
+  ) %>%
+  mutate(
+    circ = case_when(
+      str_starts(simulation, "ccaa_")            ~ "CCAA",
+      str_starts(simulation, "nat_")             ~ "National",
+      simulation == "ccaa_constituency"          ~ "CCAA",
+      simulation == "national_constituency"      ~ "National",
+      TRUE                                       ~ "Provincial"
+    ),
+    threshold = str_extract(simulation, "(?<=threshold_)0\\.?[0-9]+") %>%
+                as.numeric() %>%
+                tidyr::replace_na(0),
+    priority = case_when(
+      simulation %in% c("actual_system", "ccaa_constituency", "national_constituency") ~ 2L,
+      TRUE ~ 1L
+    )
+  ) %>%
+  arrange(desc(priority)) %>%                                 
+  distinct(election, circ, threshold, .keep_all = TRUE) %>%    
+  select(election, threshold, circ, value) %>%
+  pivot_wider(names_from = circ, values_from = value)
+
+tabla_resumen
+
+tabla_resumen_threshold <- tabla_resumen %>%
+  group_by(threshold) %>%
+  summarise(
+    Provincial = mean(Provincial, na.rm = TRUE),
+    CCAA       = mean(CCAA, na.rm = TRUE),
+    National   = mean(National, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(threshold)
+
+tabla_resumen_threshold
+
+tbl <- tabla_resumen_threshold %>%
+  transmute(
+    Threshold = percent(threshold, accuracy = 1),
+    Provincial = Provincial,
+    CCAA = CCAA,
+    National = National
+  )
+
+pal <- scales::col_numeric(
+  palette = c("#1a9850", "#ffffbf", "#d73027"),
+  domain  = range(unlist(tbl[ ,2:4]), na.rm = TRUE)
+)
+
+gt_tbl <- tbl %>%
+  gt() %>%
+  tab_header(
+    title = md("**Gallagher Index by Threshold and Constituency**"),
+    subtitle = md("Aggregated across all elections (1982–2023)")
+  ) %>%
+  cols_label(
+    Threshold = "Threshold",
+    Provincial = "Provincial",
+    CCAA = "CCAA",
+    National = "National"
+  ) %>%
+  tab_spanner(
+    label = md("**Gallagher Index (↓ better)**"),
+    columns = c(Provincial, CCAA, National)
+  ) %>%
+  fmt_number(columns = c(Provincial, CCAA, National), decimals = 2) %>%
+  cols_align(columns = everything(), align = "center") %>%
+  data_color(columns = c(Provincial, CCAA, National), colors = pal) %>%
+  opt_table_font(
+    font = list("Times New Roman", "Times", "serif")  # <- aquí la fuente
+  ) %>%
+  opt_table_lines() %>%
+  tab_options(table.font.size = px(18))
+
+
+gt_tbl
+
+```
+
+## The effect of apportionment method
+
+Distribution of Gallagher index across apportionment methods
+
+```{r}
+methods_data <- all_results_long %>%
+  filter(simulation %in% c("actual_system", "deans", "hamilton", "adams", "hagenbach", "hill", "fptp", "webster"))
+
+
+methods_gallagher <- methods_data %>%
+  filter(index == "gallagher")
+
+df_main <- methods_gallagher %>% filter(simulation != "fptp") %>%
+  mutate(simulation = reorder(simulation, value, FUN = median))
+df_fptp <- methods_gallagher %>% filter(simulation == "fptp")
+
+
+upper_main <- quantile(df_main$value, 0.98, na.rm = TRUE) * 1.05
+
+# Main plot (NO FPTP)
+p_main <- ggplot(
+  df_main,
+  aes(x = reorder(simulation, value), y = value, fill = simulation)
+) +
+  geom_violin(alpha = 0.35, color = NA, width = 0.9) +
+  geom_boxplot(width = 0.18, outlier.size = 1, alpha = 0.9, color = "grey30") +
+  coord_cartesian(ylim = c(0, upper_main)) +
+  scale_fill_manual(
+    values = palette16,
+    guide  = "none"
+  ) +
+  scale_x_discrete(labels = c(
+    actual_system = "D’Hondt",
+    adams         = "Adams",
+    deans         = "Dean",
+    hagenbach     = "Hagenbach",
+    hamilton      = "Hamilton",
+    hill          = "Hill–Huntington",
+    webster       = "Webster"
+  )) +
+  labs(
+    title = "Distribution of Gallagher index across apportionment methods",
+    subtitle = "Aggregated across all elections (1982–2023)",
+    x = "Apportionment method",
+    y = "Gallagher index"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    text = element_text(family = "Times New Roman"),
+    axis.text.x   = element_text(size = 10),
+    axis.text.y   = element_text(size = 10),
+    axis.title.x  = element_text(size = 9, margin = margin(t = 10)),
+    axis.title.y  = element_text(size = 9, margin = margin(r = 8)),
+    panel.grid.minor = element_blank(),
+    plot.title    = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 13, color = "grey35", margin = margin(b = 20)),
+    plot.margin = margin(t = 8, r = 20, b = 12, l = 10)
+  )
+
+# Right panel (FPTP only, own scale)
+p_fptp <- ggplot(
+  df_fptp,
+  aes(x = simulation, y = value, fill = simulation)
+) +
+  geom_violin(alpha = 0.35, color = NA, width = 0.9) +
+  geom_boxplot(width = 0.18, outlier.size = 1, alpha = 0.9, color = "grey30") +
+  scale_fill_manual(values = c(fptp = "red3"), breaks = "fptp", guide = "none") +
+  scale_x_discrete(labels = c(fptp = "FPTP")) +
+  labs(subtitle = "FPTP", x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(
+    text = element_text(family = "Times New Roman"),
+    axis.text.x  = element_blank(),
+    axis.ticks.x = element_blank(),
+    plot.subtitle = element_text(hjust = 0.5, face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "grey60", fill = NA, linewidth = .5)
+  )
+
+# put them together
+
+p_fptp_up <- ggdraw() +
+  draw_plot(p_fptp, x = 0, y = 0.3, width = 1, height = 0.7)  
+
+final_plot <- plot_grid(
+  p_main, p_fptp_up,
+  ncol = 2, rel_widths = c(5, 1), align = "h"
+)
+
+final_plot
+
+```
+
+Net seat changes by apportionment method
+
+```{r}
+methods_seat <- seats_data %>%
+  filter(simulation %in% c("actual_system", "deans", "hamilton", "adams", "hagenbach", "hill", "webster", "fptp"))
+
+baseline <- methods_seat %>%
+  filter(simulation == "actual_system") %>%
+  select(election, party, seats_baseline = seats)
+
+deltas <- methods_seat %>%
+  left_join(baseline, by = c("election","party")) %>%
+  mutate(dseats = seats - coalesce(seats_baseline, 0))
+
+heat_df <- deltas %>%
+  group_by(simulation, party) %>%
+  summarise(dseats_total = sum(dseats, na.rm = TRUE), .groups = "drop")
+
+
+plot_data <- heat_df %>%
+  filter(simulation != "actual_system") %>%  
+  filter(abs(dseats_total) >= 7) %>%
+  group_by(simulation) %>%
+  mutate(party = fct_reorder(party, abs(dseats_total), .desc = FALSE)) %>%
+  ungroup() %>% 
+  mutate(
+  party = fct_reorder(party, dseats_total, .desc = TRUE))
+
+
+
+ggplot(plot_data, aes(x = reorder(simulation, dseats_total), y = party, fill = dseats_total)) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  # etiqueta numérica (muestra 0 también; quita si no lo quieres)
+  geom_text(aes(label = dseats_total), size = 3.2) +
+  scale_fill_gradient2(
+    low = "#b2182b", mid = "white", high = "#1b7837",
+    midpoint = 0, name = "Seats"
+  ) +
+    scale_x_discrete(labels = c(
+    actual_system = "D’Hondt",
+    adams         = "Adams",
+    deans         = "Dean",
+    hagenbach     = "Hagenbach",
+    hamilton      = "Hamilton",
+    hill          = "Hill",
+    webster       = "Webster",
+    fptp          = "FPTP"
+  )) +
+  labs(
+    title    = "Net seat changes by apportionment method",
+    subtitle = "Relative to D’Hondt — aggregated across elections (1982-2023)",
+    x = "Method", y = NULL
+  ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      text = element_text(family = "Times New Roman"),
+      axis.text.x   = element_text(hjust = 0.5, size = 10),
+      axis.text.y   = element_text(size = 10),
+      axis.title.x  = element_text(size = 9, margin = margin(t = 10)),
+      axis.title.y  = element_text(size = 9, margin = margin(r = 8)),
+      panel.grid.minor = element_blank(),
+      plot.title    = element_text(face = "bold", size = 16),
+      plot.subtitle = element_text(size = 13, color = "grey35", margin = margin(b = 15)),
+      legend.key        = element_rect(fill = "white", color = NA),
+      legend.title      = element_text(size = 10, face = "bold"),
+      legend.text       = element_text(size = 9),
+      plot.margin = margin(t = 8, r = 12, b = 12, l = 12)
+    ) 
+```
+
+Gallagher index by Mixed Rules
+
+```{r}
+res <- all_results_long
+
+
+alts <- c(
+  "nat_webster","nat_hamilton","ccaa_webster","ccaa_hamilton",
+  "ccaa_hagenbach","nat_hagenbach", "nat_adams", "ccaa_adams"
+)
+
+label_map <- c(
+  nat_webster     = "National – Webster",
+  nat_hamilton    = "National – Hamilton",
+  nat_adams       = "National – Adams", 
+  ccaa_webster    = "CCAA – Webster",
+  ccaa_hamilton   = "CCAA – Hamilton",
+  ccaa_hagenbach  = "CCAA – Hagenbach–Bischoff",
+  nat_hagenbach   = "National – Hagenbach–Bischoff",
+  ccaa_adams = "CCAA – Adams"
+)
+
+
+present <- unique(res$simulation)
+alts <- alts[alts %in% present]
+label_map <- label_map[names(label_map) %in% alts]
+
+
+gall <- res %>%
+  filter(index == "gallagher", simulation %in% c("actual_system", alts)) %>%
+  mutate(system = recode(simulation, !!!label_map, actual_system = "D’Hondt"))
+
+base <- gall %>%
+  filter(system == "D’Hondt") %>%
+  select(election, base_val = value)
+
+deltas <- gall %>%
+  left_join(base, by = "election") %>%
+  filter(system != "D’Hondt") %>%
+  mutate(delta = value - base_val)
+
+
+summary_tbl <- deltas %>%
+  group_by(system) %>%
+  summarise(
+    mean_gallagher   = mean(value, na.rm = TRUE),
+    median_gallagher = median(value, na.rm = TRUE),
+    sd_gallagher     = sd(value, na.rm = TRUE),
+    mean_delta       = mean(delta, na.rm = TRUE),
+    median_delta     = median(delta, na.rm = TRUE),
+    best_delta       = min(delta, na.rm = TRUE),
+    worst_delta      = max(delta, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(mean_gallagher)
+
+
+pal <- col_numeric(
+  palette = c("#1a9850", "#ffffbf", "#d73027"),
+  domain  = range(summary_tbl$mean_gallagher, na.rm = TRUE)
+)
+
+gt_tbl <- summary_tbl %>%
+  transmute(
+    System              = system,
+    `Mean Gallagher`    = mean_gallagher,
+    `Median Gallagher`  = median_gallagher,
+    `SD`                = sd_gallagher,
+    `Mean Δ vs D’Hondt` = mean_delta,
+    `Best Δ`            = best_delta,
+    `Worst Δ`           = worst_delta
+  ) %>%
+  gt() %>%
+  tab_header(
+    title = md("**Gallagher Index by Mixed Rules (Method × Constituency)**"),
+    subtitle = md("Aggregated across all elections (1982–2023)")
+  ) %>%
+  tab_spanner(label = md("**Level**"),
+              columns = c(`Mean Gallagher`, `Median Gallagher`, SD)) %>%
+  tab_spanner(label = md("**Improvement vs D’Hondt**"),
+              columns = c(`Mean Δ vs D’Hondt`, `Best Δ`, `Worst Δ`)) %>%
+  fmt_number(columns = c(`Mean Gallagher`, `Median Gallagher`, SD,
+                         `Mean Δ vs D’Hondt`, `Best Δ`, `Worst Δ`),
+             decimals = 2) %>%
+  data_color(columns = c(`Mean Gallagher`), colors = pal) %>%
+  cols_align(columns = everything(), align = "center") %>%
+  tab_source_note(md("Lower = more proportional. Δ < 0 improves over D’Hondt.")) %>%
+  opt_table_lines() %>%
+  tab_options(table.font.size = px(12))
+
+gt_tbl
+```
+
+
+
