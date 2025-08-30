@@ -17,7 +17,7 @@ This repository contains the full code developed for my Master Thesis in Computa
 ## Requirements
 
 - R (≥ 4.3)
-- Main packages: pollspain, tidyverse, purrr, ggplot2, MCMCpack, stringr.
+- Main packages: pollspain, tidyverse, MCMCpack, stringr.
 
 ##  Reproducibility
 
