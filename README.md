@@ -23,5 +23,5 @@ This repository contains the full code developed for my Master Thesis in Computa
 
 All results are fully reproducible by running the R Markdown files in order:
 
-- Disproportionality study: run 01_disproportionality.Rmd (data import via summary_election_data(), generation of indices and apportionment methods, simulations across elections, and main figures for thresholds ×  constituencies × methods).
-- Robustness analysis: run 02_robustness_dirichlet.Rmd (Robustness analysis with Dirichlet-based vote perturbations).
+- Disproportionality study: run Main Analysis.Rmd (data import via summary_election_data(), generation of indices and apportionment methods, simulations across elections, and main figures for thresholds ×  constituencies × methods).
+- Robustness analysis: run Robustness Analysis.Rmd (Robustness analysis with Dirichlet-based vote perturbations).
